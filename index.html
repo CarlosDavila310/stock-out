@@ -1,0 +1,2412 @@
+<!doctype html>
+<!-- PROTOTYPE - NOT FOR PRODUCTION -->
+<!-- Question: ¿Repartirse el trabajo de una tienda 24 horas en un turno de 4 minutos se siente caótico, gracioso y de equipo? -->
+<!-- Date: 2026-11-13 -->
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stock Out!</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1D0A18; overflow: hidden; }
+  body { font-variant-numeric: tabular-nums; }
+  canvas { display: block; position: absolute; left: 0; top: 0; }
+</style>
+</head>
+<body>
+<canvas id="world"></canvas>
+<canvas id="game"></canvas>
+<script src="vendor/three.js"></script>
+<script src="config.js"></script>
+<script>
+'use strict';
+// Stock Out! Two store workers (or one and a bot) get through a 4-minute shift in a 24-hour
+// convenience store. The world is three.js under a fixed tilted camera (canvas#world); the HUD
+// is the starter's 2D canvas on top (canvas#game). Grid tiles are one world unit: tile (x, z)
+// has its centre at (x + 0.5, z + 0.5); x grows to the right, z grows toward the camera.
+
+// ---- Built to be checked ----------------------------------------------------------------
+const params = new URLSearchParams(location.search);
+const tune = new Proxy({}, { get: (_, k) => CONFIG[k].value }); // live: tune.speed is CONFIG.speed.value
+const STEP = 1 / 60;            // simulation step in seconds; motion is per second, never per frame
+const W = 1280, H = 720;        // logical size
+const PIXEL = false;
+const FONT = '"Trebuchet MS", "Segoe UI", Arial, sans-serif';
+const TITLE = 'Stock Out!';
+const CONTROLS = [
+  'J1: WASD moverse · E agarrar/soltar · F trabajar (mantener) · Q avisar',
+  'J2: flechas moverse · K agarrar/soltar · L trabajar (mantener) · J avisar',
+  'P: pausa · M: silencio',
+]; // shown on the title screen
+const clock = window.GAME_CLOCK || { now: () => performance.now() / 1000 }; // a check may inject one
+const CHEAP = params.get('render') === 'cheap'; // a headless shot or check: 3D draws cheap; players never see it
+let seed;
+function rng() { // mulberry32; every gameplay random call reads this, never Math.random
+  seed = (seed + 0x6D2B79F5) | 0;
+  let t = Math.imul(seed ^ (seed >>> 15), seed | 1);
+  t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+const events = []; // window.game.events: anything the game wants a run to see
+
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const pick = arr => arr[Math.floor(rng() * arr.length)];
+const soles = n => 'S/ ' + n.toFixed(2);
+const fmtTime = s => { s = Math.max(0, Math.ceil(s)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); };
+function lerpAng(a, b, k) {
+  let d = b - a;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return a + d * k;
+}
+
+// ---- Screen: the 3D world under, the HUD canvas on top, both fitted the same -------------
+const worldCanvas = document.getElementById('world');
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let renderer = null;
+function fit() { // fills the window at any size and pixel ratio
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  const r = s * (devicePixelRatio || 1);
+  const cw = Math.round(W * s), ch = Math.round(H * s);
+  const left = Math.max(0, Math.floor((innerWidth - cw) / 2)) + 'px';
+  const top = Math.max(0, Math.floor((innerHeight - ch) / 2)) + 'px';
+  canvas.width = Math.round(W * r); canvas.height = Math.round(H * r);
+  for (const c of [canvas, worldCanvas]) {
+    c.style.width = cw + 'px'; c.style.height = ch + 'px'; c.style.left = left; c.style.top = top;
+  }
+  ctx.setTransform(r, 0, 0, r, 0, 0); ctx.imageSmoothingEnabled = true;
+  if (renderer) renderer.setSize(cw, ch, false);
+}
+addEventListener('resize', fit); fit();
+function setFont(size, weight = 'bold') { ctx.font = `${weight} ${size}px ${FONT}`; }
+function text(s, x, y, size, c, align = 'center', weight = 'bold') {
+  ctx.fillStyle = c; setFont(size, weight); ctx.textAlign = align;
+  ctx.textBaseline = 'middle'; ctx.fillText(s, x, y);
+}
+function rrect(x, y, w, h, r) {
+  r = Math.max(0, Math.min(r, w / 2, h / 2));
+  ctx.beginPath(); ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+function panel(x, y, w, h, fill, stroke = '#111111', lw = 3, r = 10) {
+  rrect(x, y, w, h, r); ctx.fillStyle = fill; ctx.fill();
+  if (stroke) { ctx.lineWidth = lw; ctx.strokeStyle = stroke; ctx.stroke(); }
+}
+function pill(s, x, y, size, bg, fg) {
+  setFont(size); const w = ctx.measureText(s).width + size * 1.2;
+  panel(x - w / 2, y - size * 0.85, w, size * 1.7, bg, '#111111', 2, size * 0.85);
+  text(s, x, y + 1, size, fg); return w;
+}
+function meter(x, y, w, h, f, color) {
+  panel(x, y, w, h, '#2B2230', '#111111', 2, h / 2);
+  const fw = (w - 4) * clamp(f, 0, 1);
+  if (fw > 1) { rrect(x + 2, y + 2, fw, h - 4, (h - 4) / 2); ctx.fillStyle = color; ctx.fill(); }
+}
+
+// ---- Input: keys by position (event.code), OS key repeat ignored ------------------------
+const down = new Set(), hit = new Set();
+const pressed = code => hit.has(code); // true for one step after the key goes down
+addEventListener('keydown', e => {
+  startAudio();
+  if (!e.repeat) { down.add(e.code); hit.add(e.code); }
+  if (e.code === 'Space' || e.code.startsWith('Arrow')) e.preventDefault();
+});
+addEventListener('keyup', e => down.delete(e.code));
+addEventListener('pointerdown', () => startAudio());
+addEventListener('blur', () => down.clear());
+const KEYS = {
+  p1: { up: 'KeyW', down: 'KeyS', left: 'KeyA', right: 'KeyD', grab: 'KeyE', work: 'KeyF', signal: 'KeyQ' },
+  p2: { up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', grab: 'KeyK', work: 'KeyL', signal: 'KeyJ' },
+};
+
+// ---- Audio: started on first input, mute on M --------------------------------------------
+let audio = null, muted = false;
+function startAudio() {
+  if (!audio) {
+    const ac = window.GAME_AUDIO || new (window.AudioContext || window.webkitAudioContext)(); // a check may inject one
+    const out = ac.createGain(); out.gain.value = muted ? 0 : tune.volume;
+    out.connect(ac.destination); audio = { ac, out };
+  }
+  if (audio.ac.state === 'suspended') audio.ac.resume();
+}
+function setMuted(m) { muted = m; if (audio) audio.out.gain.value = m ? 0 : tune.volume; }
+addEventListener('tune', () => setMuted(muted)); // the tweak panel (an add-on), when added, moved a value: the volume follows
+function beep(freq, dur, type = 'square', vol = 0.2, delay = 0) {
+  if (!audio || muted) return;
+  const ac = audio.ac, t = ac.currentTime + delay, o = ac.createOscillator(), g = ac.createGain();
+  o.type = type; o.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, ac.currentTime); g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g).connect(audio.out); o.start(t); o.stop(t + dur + 0.02);
+}
+function sweep(f0, f1, dur, type = 'sine', vol = 0.2, delay = 0) {
+  if (!audio || muted) return;
+  const ac = audio.ac, t = ac.currentTime + delay, o = ac.createOscillator(), g = ac.createGain();
+  o.type = type; o.frequency.setValueAtTime(f0, t); o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  g.gain.setValueAtTime(0.0001, ac.currentTime); g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g).connect(audio.out); o.start(t); o.stop(t + dur + 0.02);
+}
+let noiseBuf = null;
+function noise(dur, vol = 0.2, delay = 0) {
+  if (!audio || muted) return;
+  const ac = audio.ac;
+  if (!noiseBuf) { // fixed noise from its own generator, so gameplay rng() is untouched
+    noiseBuf = ac.createBuffer(1, Math.floor(ac.sampleRate * 0.6), ac.sampleRate);
+    const d = noiseBuf.getChannelData(0); let s = 12345;
+    for (let i = 0; i < d.length; i++) { s = (Math.imul(s, 1103515245) + 12345) | 0; d[i] = ((s >>> 16) & 0x7fff) / 16384 - 1; }
+  }
+  const t = ac.currentTime + delay, src = ac.createBufferSource(), g = ac.createGain();
+  src.buffer = noiseBuf; g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  src.connect(g).connect(audio.out); src.start(t); src.stop(t + dur + 0.02);
+}
+const sfx = {
+  chime() { beep(1046, 0.3, 'sine', 0.1); beep(784, 0.45, 'sine', 0.1, 0.16); },
+  cash() { beep(1568, 0.1, 'triangle', 0.18); beep(2093, 0.28, 'triangle', 0.16, 0.08); },
+  ready() { beep(1318, 0.14, 'sine', 0.2); beep(1760, 0.22, 'sine', 0.2, 0.12); },
+  alarm() { beep(880, 0.07, 'square', 0.07); },
+  burn() { sweep(420, 90, 0.5, 'sawtooth', 0.1); noise(0.4, 0.12); },
+  slip() { sweep(300, 1500, 0.32, 'sine', 0.2); beep(140, 0.16, 'square', 0.13, 0.34); noise(0.12, 0.15, 0.34); },
+  splash() { noise(0.25, 0.14); sweep(900, 300, 0.2, 'sine', 0.08); },
+  bump() { beep(110, 0.12, 'square', 0.18); noise(0.08, 0.2); },
+  grab() { beep(660, 0.05, 'square', 0.05); },
+  drop() { beep(440, 0.05, 'square', 0.05); },
+  angry() { sweep(330, 130, 0.45, 'sawtooth', 0.1); },
+  wrong() { beep(210, 0.1, 'square', 0.09); beep(160, 0.14, 'square', 0.09, 0.1); },
+  task() { beep(880, 0.07, 'triangle', 0.14); beep(1175, 0.12, 'triangle', 0.14, 0.06); },
+  banner() { beep(659, 0.12, 'square', 0.08); beep(988, 0.22, 'square', 0.08, 0.12); },
+  signal() { beep(1250, 0.07, 'sine', 0.16); beep(1250, 0.07, 'sine', 0.16, 0.12); },
+  up() { sweep(400, 900, 0.15, 'sine', 0.14); },
+  star(i) { beep([880, 1109, 1319][i] || 1319, 0.35, 'triangle', 0.18); },
+  lose() { sweep(500, 120, 0.9, 'sawtooth', 0.1); },
+};
+
+// ---- Palette and catalogue: magenta leads, yellow marks what to act on ----------------------
+const COL = {
+  mag: '#AF1280', yel: '#FFEE0C', white: '#FFFFFF', ink: '#111111',
+  wall: '#F4F0F5', fridge: '#3F8FD8', oven: '#F07F22', green: '#2DB36B', amber: '#F2A33A', red: '#E0393E',
+  card: '#C8945A', spill: '#7FD3F2', steel: '#A3A8B4', plum: '#2A0F24',
+  black: '#1E1D22', top: '#3B3742', metal: '#B5BAC4', metalDark: '#8D93A0', // the store's dark tops and wire shelving
+  skin: ['#F1C9A5', '#E0AC85', '#C68B62', '#8D5A3B'],
+};
+const PRODS = ['snacks', 'galletas', 'abarrotes', 'bebidas'];
+const PROD = {
+  snacks: { name: 'Snacks', color: '#E8541E' },
+  galletas: { name: 'Galletas', color: '#B5651D' },
+  abarrotes: { name: 'Abarrotes', color: '#2E9E5B' },
+  bebidas: { name: 'Bebidas', color: '#2A7DE1' },
+};
+const FOODS = ['empanada', 'hamburguesa', 'postre'];
+const FOOD_NAME = { empanada: 'Empanada', hamburguesa: 'Hamburguesa', postre: 'Postre' };
+const COLD = f => f === 'postre'; // served cold, never through the oven
+const price = k => tune['price_' + k];
+// Each kind of customer: how fast it walks, how patient it is, how likely it spills a drink
+// (times spill_chance) and how tall it stands (for the bubbles over its head).
+const KIND = {
+  escolar: { speed: 'speed_escolar', patience: 'patience_escolar', spill: 0.6, h: 0.86 },
+  abuelita: { speed: 'speed_abuelita', patience: 'patience_abuelita', spill: 1.6, h: 0.86 },
+  oficinista: { speed: 'speed_oficinista', patience: 'patience_oficinista', spill: 0.5, h: 1.3 },
+  obrero: { speed: 'speed_obrero', patience: 'patience_obrero', spill: 0.8, h: 1.08 },
+  deportista: { speed: 'speed_deportista', patience: 'patience_deportista', spill: 1.3, h: 1.04 },
+};
+
+// ---- The store: one map, one fixture per tile ------------------------------------------------
+// 1-4 boxes of snacks, galletas, abarrotes, bebidas · E/H/D freezers of boxes (empanadas,
+// hamburguesas, postres) · T mop · C dumpster · s storeroom racks · w low wall · R drinks fridges
+// · g/k/a shelves (snacks, galletas, abarrotes) · M counter · V the case where orders are handed
+// over · K the two tills · F the cold display of food beside the tills · O oven · d back counter
+// · f ice-cream freezer · B bin · | gate
+const MAP = [
+  '####################',
+  '#1234...EHDT.C.ssss#',
+  '#..................#',
+  '#..................#',
+  '#wwwww..wwwwwwwwwww#',
+  '#R.................#',
+  '#R.ggg.......MMMMM|#',
+  '#R......aaa..M.....#',
+  '#R...........V....d#',
+  '#..kkk.......K....d#',
+  '#............K.....#',
+  '#f........B..F.OO..#',
+  '##..################',
+];
+const GW = 20, GH = 13;
+const DIRS4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+const tileCh = (x, z) => (x < 0 || z < 0 || x >= GW || z >= GH) ? '#' : MAP[z][x];
+const staffOK = (x, z) => { const c = tileCh(x, z); return c === '.' || c === '|'; };
+const inZone = (x, z) => x >= 14 && x <= 18 && z >= 7 && z <= 11;      // behind the counter
+const inZonePos = e => inZone(Math.floor(e.x), Math.floor(e.z));
+const pubOK = (x, z) => tileCh(x, z) === '.' && z >= 5 && !inZone(x, z); // where customers walk
+const DOOR = [[2, 12], [3, 12]];
+// One queue for both tills: the head walks to the first free till; the rest wait in this line.
+const QWAIT = [[11, 10], [10, 10], [9, 10], [8, 10], [7, 10], [6, 10], [5, 11], [4, 11], [3, 11]];
+const PSLOTS = [[12, 8], [12, 7], [11, 7], [12, 6], [11, 6], [12, 5]]; // waiting for hot food, by the case
+
+const FIX = Array.from({ length: GH }, () => Array(GW).fill(null));
+const fixAt = (x, z) => (x < 0 || z < 0 || x >= GW || z >= GH) ? null : FIX[z][x];
+const INTERACT = new Set(['crate', 'freezer', 'mopstand', 'dumpster', 'shelf', 'counter', 'register', 'oven', 'bin', 'display']);
+const shelves = {}, ovens = [], counters = [], crates = {}, freezers = {}, tills = [];
+let bin = null, pickupFx = null, mopStand = null, dumpster = null, display = null;
+(function buildFixtures() {
+  const shelfCh = { g: 'snacks', k: 'galletas', a: 'abarrotes', R: 'bebidas' };
+  for (let z = 0; z < GH; z++) for (let x = 0; x < GW; x++) {
+    const c = MAP[z][x]; let f = null;
+    if ('1234'.includes(c)) { f = { type: 'crate', prod: PRODS[+c - 1], h: 0.85 }; crates[f.prod] = f; }
+    else if (c === 'E' || c === 'H' || c === 'D') { f = { type: 'freezer', food: { E: 'empanada', H: 'hamburguesa', D: 'postre' }[c], h: 0.8 }; freezers[f.food] = f; }
+    else if (c === 'F') f = display = { type: 'display', stock: {}, fill: 0, h: 1.25, slots: {} };
+    else if (c === 'T') f = mopStand = { type: 'mopstand', h: 0.5 };
+    else if (c === 'C') f = dumpster = { type: 'dumpster', h: 0.9 };
+    else if (shelfCh[c]) {
+      const prod = shelfCh[c];
+      const sh = shelves[prod] || (shelves[prod] = { prod, fridge: c === 'R', tiles: [], stock: 0, cap: 1, emptyT: 0, fill: 0, slots: [], alert: null });
+      sh.tiles.push([x, z]); f = { type: 'shelf', shelf: sh, h: c === 'R' ? 1.75 : 0.98 };
+    }
+    else if (c === 'M' || c === 'V') { f = { type: 'counter', pickup: c === 'V', item: null, h: c === 'V' ? 1.3 : 0.87 }; counters.push(f); if (c === 'V') pickupFx = f; }
+    else if (c === 'K') { f = { type: 'register', h: 0.87, spot: [x - 1, z], cust: null }; tills.push(f); }
+    else if (c === 'O') { f = { type: 'oven', item: null, h: 1.05, glow: null, alarmT: 0 }; ovens.push(f); }
+    else if (c === 'B') f = bin = { type: 'bin', fill: 0, h: 0.75, lid: null, papers: null };
+    if (f) { f.x = x; f.z = z; FIX[z][x] = f; }
+  }
+  const around = (tiles, ok) => {
+    const out = [];
+    for (const [x, z] of tiles) for (const [dx, dz] of DIRS4) {
+      const nx = x + dx, nz = z + dz;
+      if (ok(nx, nz) && !out.some(t => t[0] === nx && t[1] === nz)) out.push([nx, nz]);
+    }
+    return out;
+  };
+  for (const row of FIX) for (const f of row) if (f) {
+    f.staffAccess = around([[f.x, f.z]], staffOK);
+    f.floorAccess = f.staffAccess.filter(([x, z]) => !inZone(x, z));
+  }
+  for (const p of PRODS) {
+    const sh = shelves[p];
+    sh.staffAccess = around(sh.tiles, staffOK); sh.pubAccess = around(sh.tiles, pubOK);
+    const xs = sh.tiles.map(t => t[0]), zs = sh.tiles.map(t => t[1]);
+    sh.cx = (Math.min(...xs) + Math.max(...xs) + 1) / 2; sh.cz = (Math.min(...zs) + Math.max(...zs) + 1) / 2;
+    sh.w = Math.max(...xs) - Math.min(...xs) + 1; sh.d = Math.max(...zs) - Math.min(...zs) + 1;
+  }
+})();
+// ---- Difficulty: Intermedio is config.js as it stands; Fácil and Difícil scale a few values ----
+const DIFFS = ['tutorial', 'facil', 'intermedio', 'dificil'];
+const DIFF_NAME = { tutorial: 'Tutorial', facil: 'Fácil', intermedio: 'Intermedio', dificil: 'Difícil' };
+let diff = 'intermedio';
+const diffKey = name => (diff === 'dificil' ? 'hard_' : 'easy_') + name; // the tutorial runs on Fácil's values
+function dm(name) { return diff === 'intermedio' ? 1 : tune[diffKey(name)]; } // a multiplier
+function maxCustomers() { return diff === 'intermedio' ? tune.max_customers : tune[diffKey('max_customers')]; }
+function starGoal(n) { return diff === 'intermedio' ? tune['star' + n] : tune[diffKey('star' + n)]; }
+function burnTime() { return tune.burn_time * dm('burn'); }
+function foodState(it) {
+  if (COLD(it.food)) return 'ready';
+  if (it.cook <= 0) return 'frozen';
+  if (it.cook < tune.cook_time) return 'heating';
+  return it.cook < tune.cook_time + burnTime() ? 'ready' : 'burned';
+}
+// Breadth-first path over the grid: the tiles from the start's next step to the first goal.
+function bfs(sx, sz, isGoal, ok, avoid) {
+  const start = sz * GW + sx;
+  if (sx < 0 || sz < 0 || sx >= GW || sz >= GH) return null;
+  const prev = new Int16Array(GW * GH).fill(-1);
+  const q = [start]; prev[start] = start;
+  let head = 0, found = -1;
+  while (head < q.length) {
+    const i = q[head++], x = i % GW, z = (i / GW) | 0;
+    if (isGoal(x, z)) { found = i; break; }
+    for (const [dx, dz] of DIRS4) {
+      const nx = x + dx, nz = z + dz;
+      if (nx < 0 || nz < 0 || nx >= GW || nz >= GH) continue;
+      const j = nz * GW + nx;
+      if (prev[j] !== -1 || !ok(nx, nz)) continue;
+      if (avoid && avoid(nx, nz) && !isGoal(nx, nz)) continue;
+      prev[j] = i; q.push(j);
+    }
+  }
+  if (found < 0) return null;
+  const path = [];
+  for (let i = found; i !== start; i = prev[i]) path.push([i % GW, (i / GW) | 0]);
+  return path.reverse();
+}
+
+// ---- Three.js: materials, shapes and the outline every figure gets ---------------------------
+const T3 = window.THREE;
+let world3 = null, camera = null, figScene = null, figCam = null;
+const figLabels = [], views = {}, parts = [], HL = [];
+const V3 = T3 ? new T3.Vector3() : null;
+let OUT_MAT = null, SHADOW_MAT = null, HL_MAT = null;
+const matCache = new Map(), geoCache = new Map();
+function mat(color, opts) {
+  const key = color + (opts ? JSON.stringify(opts) : '');
+  if (!matCache.has(key)) matCache.set(key, new T3.MeshLambertMaterial({ color, flatShading: true, ...opts }));
+  return matCache.get(key);
+}
+function geo(key, make) { let g = geoCache.get(key); if (!g) { g = make(); geoCache.set(key, g); } return g; }
+const BOX = (w, h, d) => geo(`b${w},${h},${d}`, () => new T3.BoxGeometry(w, h, d));
+const CYL = (rt, rb, h, s = 10) => geo(`c${rt},${rb},${h},${s}`, () => new T3.CylinderGeometry(rt, rb, h, s));
+const SPH = (r, ws = 10, hs = 8) => geo(`s${r},${ws},${hs}`, () => new T3.SphereGeometry(r, ws, hs));
+const DOME = (r, frac = 0.5) => geo(`d${r},${frac}`, () => new T3.SphereGeometry(r, 12, 6, 0, Math.PI * 2, 0, Math.PI * frac));
+// The black outline: a back-faced shell a little larger than the shape (the inverted hull),
+// sized per axis so thin and long shapes get the same line weight.
+function outline(mesh, t = 0.022) {
+  const g = mesh.geometry; if (!g.boundingBox) g.computeBoundingBox();
+  const s = g.boundingBox.getSize(new T3.Vector3()), c = g.boundingBox.getCenter(new T3.Vector3());
+  const o = new T3.Mesh(g, OUT_MAT);
+  o.scale.set(1 + 2 * t / Math.max(s.x, 0.02), 1 + 2 * t / Math.max(s.y, 0.02), 1 + 2 * t / Math.max(s.z, 0.02));
+  o.position.set(-c.x * (o.scale.x - 1), -c.y * (o.scale.y - 1), -c.z * (o.scale.z - 1));
+  mesh.add(o); return mesh;
+}
+function part(g, color, x = 0, y = 0, z = 0, ol = 0.022) {
+  const m = new T3.Mesh(g, typeof color === 'string' ? mat(color) : color);
+  m.position.set(x, y, z); if (ol) outline(m, ol); return m;
+}
+
+// ---- Characters: round, big-headed, every kind its own silhouette ---------------------------
+function makeChar(o) {
+  const g = new T3.Group(), body = new T3.Group(); g.add(body);
+  const legH = 0.2 * o.h, torsoH = 0.36 * o.h, hr = o.hr || 0.24, w = o.w;
+  const shadow = new T3.Mesh(geo('shadow', () => new T3.CircleGeometry(0.32, 16)), SHADOW_MAT);
+  shadow.rotation.x = -Math.PI / 2; shadow.position.y = 0.013; shadow.scale.setScalar(w); g.add(shadow);
+  const legs = [];
+  if (o.robot) { // the bot rolls on a wheel
+    body.add(part(CYL(0.15, 0.22, legH + 0.02, 10), '#8D93A0', 0, legH / 2, 0));
+    body.add(part(SPH(0.08, 8, 6), COL.ink, 0, 0.07, 0, 0));
+  } else {
+    for (const sx of [-1, 1]) {
+      const p = new T3.Group(); p.position.set(sx * 0.085 * w, legH, 0);
+      p.add(part(CYL(0.065 * w, 0.06 * w, legH, 8), o.pants, 0, -legH / 2, 0, 0.016));
+      p.add(part(BOX(0.11, 0.06, 0.17), o.shoes || '#2A2A2E', 0, -legH + 0.03, 0.03, 0.012));
+      body.add(p); legs.push(p);
+    }
+  }
+  body.add(part(CYL(0.19 * w, 0.23 * w, torsoH, 10), o.shirt, 0, legH + torsoH / 2, 0));
+  const arms = [];
+  for (const sx of [-1, 1]) {
+    const p = new T3.Group(); p.position.set(sx * (0.21 * w + 0.05), legH + torsoH - 0.05, 0);
+    p.add(part(CYL(0.05, 0.045, 0.26, 8), o.sleeve || o.shirt, 0, -0.13, 0, 0.016));
+    p.add(part(SPH(0.055, 8, 6), o.hand || o.skin, 0, -0.28, 0, 0.016));
+    body.add(p); arms.push(p);
+  }
+  const head = new T3.Group(); head.position.set(0, legH + torsoH + hr * 0.92, 0); body.add(head);
+  if (!o.robot) {
+    head.add(part(SPH(hr, 12, 10), o.skin, 0, 0, 0, 0.022));
+    for (const sx of [-1, 1]) head.add(part(SPH(0.034, 6, 5), COL.ink, sx * hr * 0.36, hr * 0.1, hr * 0.9, 0));
+    head.add(part(BOX(0.08, 0.02, 0.02), '#6B2A2A', 0, -hr * 0.32, hr * 0.93, 0));
+  }
+  return { g, body, legs, arms, head, hr, legH, torsoH, phase: 0, ang: 0, bob: 0 };
+}
+function makeWorker(style) {
+  const robot = style === 'bot';
+  const c = makeChar({ h: 1, w: 1, shirt: COL.mag, pants: '#2F2A36', skin: style === 'j2' ? COL.skin[2] : COL.skin[1], hand: robot ? '#C9CED8' : null, robot });
+  // the store's uniform: a black apron over the magenta shirt, tied at the waist, a white name tag
+  c.body.add(part(BOX(0.3, c.torsoH * 0.8, 0.03), COL.black, 0, c.legH + c.torsoH * 0.42, 0.205, 0.012));
+  c.body.add(part(CYL(0.235, 0.235, 0.04, 12), COL.black, 0, c.legH + 0.04, 0, 0));
+  c.body.add(part(BOX(0.09, 0.05, 0.02), '#FFFFFF', 0.07, c.legH + c.torsoH * 0.6, 0.225, 0));
+  if (!robot) { // a black cap with its peak and a magenta patch
+    c.head.add(part(DOME(c.hr * 1.05), COL.black, 0, c.hr * 0.08, 0, 0.02));
+    c.head.add(part(BOX(0.28, 0.035, 0.2), COL.black, 0, c.hr * 0.16, c.hr * 0.98, 0.014));
+    c.head.add(part(BOX(0.09, 0.06, 0.02), COL.mag, 0, c.hr * 0.6, c.hr * 0.88, 0));
+  }
+  if (style === 'j2') { // long hair down both sides of the face, and a ponytail out of the back of the cap
+    for (const sx of [-1, 1]) c.head.add(part(BOX(0.08, 0.34, 0.2), '#3B2418', sx * c.hr * 0.98, -c.hr * 0.3, -0.03, 0.016));
+    c.head.add(part(BOX(c.hr * 1.9, 0.34, 0.1), '#3B2418', 0, -c.hr * 0.3, -c.hr * 0.85, 0.016));
+    c.head.add(part(SPH(0.1, 8, 6), '#3B2418', 0, c.hr * 0.25, -c.hr * 1.08, 0.018));
+    c.head.add(part(CYL(0.055, 0.03, 0.26, 8), '#3B2418', 0, -0.06, -c.hr * 1.22, 0.016));
+  } else if (robot) { // the bot: a boxy head, a visor and an antenna
+    c.head.add(part(BOX(0.46, 0.38, 0.42), '#D5D9E2', 0, 0, 0, 0.022));
+    c.head.add(part(BOX(0.38, 0.15, 0.03), '#1B1E26', 0, 0.02, 0.215, 0));
+    const eye = mat('#5FF2FF', { emissive: '#3FD8F0' });
+    for (const sx of [-1, 1]) c.head.add(part(BOX(0.07, 0.05, 0.02), eye, sx * 0.09, 0.025, 0.235, 0));
+    c.head.add(part(CYL(0.016, 0.016, 0.2, 6), '#8D93A0', 0, 0.29, 0, 0));
+    c.head.add(part(SPH(0.05, 8, 6), COL.mag, 0, 0.4, 0, 0.016));
+  }
+  return c;
+}
+function makeCustomer(kind, skin) {
+  const sk = COL.skin[skin % COL.skin.length];
+  let c;
+  if (kind === 'escolar') { // small, with a big backpack
+    c = makeChar({ h: 0.8, w: 0.86, shirt: '#F4F4F6', pants: '#4E5A70', skin: sk, hr: 0.23 });
+    c.head.add(part(DOME(c.hr * 1.06, 0.5), '#1E1A1A', 0, c.hr * 0.05, -0.01, 0.02));
+    const y = c.legH + c.torsoH * 0.55;
+    c.body.add(part(BOX(0.32, 0.36, 0.17), '#2F6FD6', 0, y, -0.25, 0.022));
+    c.body.add(part(BOX(0.26, 0.12, 0.05), '#1F4FA6', 0, y + 0.1, -0.345, 0.012));
+  } else if (kind === 'abuelita') { // short and wide, a skirt, a bun and a handbag
+    c = makeChar({ h: 0.82, w: 1.12, shirt: '#9C7BC6', pants: '#6E4A3A', skin: sk, hr: 0.22 });
+    c.body.add(part(CYL(0.2, 0.34, c.legH + 0.06, 12), '#6E4A3A', 0, (c.legH + 0.06) / 2, 0));
+    c.head.add(part(DOME(c.hr * 1.07, 0.55), '#C9C9D3', 0, c.hr * 0.03, -0.01, 0.02));
+    c.head.add(part(SPH(0.1, 8, 6), '#C9C9D3', 0, c.hr * 1.05, -c.hr * 0.25, 0.018));
+    c.head.add(part(BOX(0.24, 0.05, 0.02), '#5A4A6A', 0, c.hr * 0.1, c.hr * 0.98, 0));
+    const bag = new T3.Group(); bag.position.set(0, -0.32, 0.03); c.arms[1].add(bag);
+    bag.add(part(BOX(0.22, 0.17, 0.1), '#8E3B2E', 0, -0.06, 0, 0.018));
+    bag.add(part(geo('handle', () => new T3.TorusGeometry(0.07, 0.015, 6, 12, Math.PI)), '#5A2218', 0, 0.02, 0, 0));
+  } else if (kind === 'oficinista') { // tall and thin, a tie and a briefcase
+    c = makeChar({ h: 1.32, w: 0.82, shirt: '#26324F', pants: '#1E2638', skin: sk, hr: 0.23 });
+    c.head.add(part(DOME(c.hr * 1.05, 0.42), '#151515', 0, c.hr * 0.12, -0.01, 0.018));
+    const y = c.legH + c.torsoH;
+    c.body.add(part(BOX(0.12, 0.2, 0.02), '#F4F4F6', 0, y - 0.11, 0.185, 0));
+    c.body.add(part(BOX(0.05, 0.22, 0.02), '#C0392B', 0, y - 0.14, 0.198, 0));
+    const brief = new T3.Group(); brief.position.set(0, -0.36, 0); c.arms[0].add(brief);
+    brief.add(part(BOX(0.32, 0.23, 0.08), '#5A3A22', 0, -0.06, 0, 0.018));
+  } else if (kind === 'obrero') { // broad, a vest with stripes and a hard hat
+    c = makeChar({ h: 1.03, w: 1.34, shirt: '#EE7A1A', sleeve: '#3D5A80', pants: '#34495E', skin: sk, hr: 0.25 });
+    const y = c.legH + c.torsoH * 0.5;
+    for (const dy of [-0.06, 0.06]) c.body.add(part(CYL(0.288, 0.292, 0.03, 12), '#D8DCE2', 0, y + dy, 0, 0));
+    c.head.add(part(DOME(c.hr * 1.1, 0.5), '#F7F7F7', 0, c.hr * 0.12, 0, 0.02));
+    c.head.add(part(CYL(c.hr * 1.35, c.hr * 1.35, 0.03, 14), '#F7F7F7', 0, c.hr * 0.14, 0, 0.012));
+  } else { // deportista: tracksuit, backwards cap, headphones
+    c = makeChar({ h: 1.0, w: 0.95, shirt: '#16A39A', pants: '#16A39A', skin: sk, shoes: '#F4F4F6', hr: 0.24 });
+    c.head.add(part(DOME(c.hr * 1.06, 0.5), '#D93A3A', 0, c.hr * 0.08, 0, 0.02));
+    c.head.add(part(BOX(0.22, 0.03, 0.17), '#D93A3A', 0, c.hr * 0.16, -c.hr * 1.0, 0.012));
+    c.head.add(part(geo('phones', () => new T3.TorusGeometry(0.27, 0.025, 6, 16, Math.PI)), COL.ink, 0, 0.04, 0, 0));
+    for (const sx of [-1, 1]) { const cup = part(CYL(0.07, 0.07, 0.06, 10), COL.ink, sx * 0.25, 0.0, 0, 0); cup.rotation.z = Math.PI / 2; c.head.add(cup); }
+    for (const a of c.arms) a.add(part(BOX(0.025, 0.22, 0.03), '#FFFFFF', 0, -0.13, 0.05, 0));
+  }
+  return c;
+}
+
+// ---- Things to carry: boxes, food, the mop and the trash bag ----------------------------------
+function productMesh(prod, color) {
+  const g = new T3.Group(), c = color || PROD[prod].color;
+  if (prod === 'snacks') { // a crimped bag
+    g.add(part(BOX(0.16, 0.2, 0.07), c, 0, 0.1, 0, 0.012));
+    g.add(part(BOX(0.165, 0.045, 0.075), '#FFFFFF', 0, 0.09, 0, 0));
+    g.add(part(BOX(0.17, 0.03, 0.05), '#F7A23A', 0, 0.21, 0, 0.01));
+  } else if (prod === 'galletas') { // a roll pack
+    const m = part(CYL(0.055, 0.055, 0.2, 10), c, 0, 0.056, 0, 0.012); m.rotation.z = Math.PI / 2; g.add(m);
+    const b = part(CYL(0.058, 0.058, 0.06, 10), '#2D5FD0', 0, 0.056, 0, 0); b.rotation.z = Math.PI / 2; g.add(b);
+  } else if (prod === 'abarrotes') { // a tin with a label
+    g.add(part(CYL(0.06, 0.06, 0.15, 10), c, 0, 0.075, 0, 0.012));
+    g.add(part(CYL(0.062, 0.062, 0.06, 10), '#FFFFFF', 0, 0.075, 0, 0));
+    g.add(part(CYL(0.05, 0.05, 0.012, 10), '#C8CCD4', 0, 0.156, 0, 0));
+  } else { // a bottle
+    g.add(part(CYL(0.045, 0.05, 0.17, 8), c, 0, 0.085, 0, 0.012));
+    g.add(part(CYL(0.02, 0.045, 0.045, 8), c, 0, 0.19, 0, 0));
+    g.add(part(CYL(0.022, 0.022, 0.03, 8), '#D33A3A', 0, 0.225, 0, 0.01));
+  }
+  return g;
+}
+function boxMesh(prod) {
+  const g = new T3.Group();
+  g.add(part(BOX(0.42, 0.28, 0.34), COL.card, 0, 0.14, 0, 0.02));
+  g.add(part(BOX(0.425, 0.07, 0.345), PROD[prod].color, 0, 0.14, 0, 0));
+  g.add(part(BOX(0.43, 0.015, 0.08), '#E9D7AE', 0, 0.285, 0, 0));
+  const p = productMesh(prod); p.position.y = 0.29; g.add(p);
+  return g;
+}
+// Per material: frozen, ready; burnt is shared. Empanada: crust. Hamburguesa: bun, patty, lettuce,
+// cheese. Postre (a slice of cake, served cold): sponge, cream, pink icing, strawberry.
+const FOODCOL = {
+  empanada: { frozen: ['#E8EEF4'], ready: ['#D99A3E'] },
+  hamburguesa: { frozen: ['#EDE7DD', '#C9B3AE', '#D7E6D3', '#F1E6C8'], ready: ['#E0A458', '#5C3317', '#4FAE3F', '#F4B83A'] },
+  postre: { frozen: ['#F3D9A4', '#FFF6EA', '#F49AC1', '#D93A3A'], ready: ['#F3D9A4', '#FFF6EA', '#F49AC1', '#D93A3A'] },
+};
+function foodBoxMesh(food) { // a frozen carton of one food, for the cold display
+  const g = new T3.Group();
+  g.add(part(BOX(0.42, 0.28, 0.34), COL.card, 0, 0.14, 0, 0.02));
+  g.add(part(BOX(0.425, 0.07, 0.345), '#9FD8F5', 0, 0.14, 0, 0));
+  g.add(part(BOX(0.43, 0.015, 0.08), '#E9D7AE', 0, 0.285, 0, 0));
+  const m = foodMesh(food); paintFood(m, food, 0); m.position.y = 0.29; m.scale.setScalar(1.1); g.add(m);
+  return g;
+}
+const BURNT = ['#2B211D', '#1A1310', '#22261C', '#2E2416'];
+function foodMesh(kind) {
+  const g = new T3.Group();
+  const mats = FOODCOL[kind].ready.map(c => new T3.MeshLambertMaterial({ color: c, flatShading: true, side: T3.DoubleSide }));
+  const [a, b, c, d] = mats;
+  if (kind === 'empanada') { // a plump half moon with a crimped edge
+    const m = part(geo('emp', () => new T3.SphereGeometry(0.16, 12, 8, 0, Math.PI)), a, 0, 0.035, -0.06, 0.018);
+    m.scale.y = 0.42; g.add(m);
+    for (let i = 0; i < 6; i++) {
+      const t = (i + 0.5) / 6 * Math.PI;
+      g.add(part(SPH(0.028, 6, 4), a, -Math.cos(t) * 0.16, 0.035, Math.sin(t) * 0.16 - 0.06, 0));
+    }
+  } else if (kind === 'postre') { // a wedge of layered cake with a strawberry on top
+    const wedge = h => geo('cake' + h, () => new T3.CylinderGeometry(0.17, 0.17, h, 8, 1, false, -Math.PI / 6, Math.PI / 3));
+    g.add(part(wedge(0.06), a, 0, 0.03, -0.08, 0.016));
+    g.add(part(wedge(0.025), b, 0, 0.0725, -0.08, 0));
+    g.add(part(wedge(0.05), a, 0, 0.11, -0.08, 0.016));
+    g.add(part(wedge(0.025), c, 0, 0.1475, -0.08, 0.012));
+    g.add(part(SPH(0.03, 8, 6), d, 0, 0.18, 0.02, 0.01));
+  } else { // bun, patty, lettuce, a cheese slice with its corners out, a domed top with sesame
+    g.add(part(CYL(0.13, 0.12, 0.05, 12), a, 0, 0.025, 0, 0.016));
+    g.add(part(CYL(0.135, 0.135, 0.045, 12), b, 0, 0.072, 0, 0.014));
+    g.add(part(CYL(0.148, 0.148, 0.014, 12), c, 0, 0.1, 0, 0));
+    const ch = part(BOX(0.19, 0.012, 0.19), d, 0, 0.11, 0, 0); ch.rotation.y = Math.PI / 4; g.add(ch);
+    const top = part(DOME(0.13), a, 0, 0.115, 0, 0.016); top.scale.y = 0.72; g.add(top);
+    for (const [x, z] of [[0.04, 0.02], [-0.03, 0.05], [-0.02, -0.05], [0.06, -0.03], [-0.07, 0.0]]) g.add(part(BOX(0.018, 0.008, 0.01), '#FFF7E6', x, 0.198 - Math.hypot(x, z) * 0.35, z, 0));
+  }
+  g.userData.mats = mats;
+  return g;
+}
+const _ca = T3 ? new T3.Color() : null, _cb = T3 ? new T3.Color() : null;
+function paintFood(mesh, kind, cook) { // frozen pale, golden when ready, darker as it overcooks
+  const def = FOODCOL[kind], r = tune.cook_time, bt = burnTime();
+  mesh.userData.mats.forEach((m, i) => {
+    _ca.set(def.frozen[i]); _cb.set(def.ready[i]); m.color.lerpColors(_ca, _cb, clamp(cook / r, 0, 1));
+    if (cook > r) { _cb.set(BURNT[i]); m.color.lerp(_cb, cook >= r + bt ? 1 : clamp((cook - r) / bt, 0, 1) * 0.5); }
+  });
+}
+function mopMesh() {
+  const g = new T3.Group();
+  g.add(part(CYL(0.022, 0.022, 1.0, 6), '#8A5A2B', 0, 0.55, 0, 0.012));
+  g.add(part(BOX(0.34, 0.06, 0.12), '#7D828E', 0, 0.06, 0, 0.014));
+  g.add(part(BOX(0.36, 0.05, 0.15), '#ECECF2', 0, 0.025, 0, 0.012));
+  return g;
+}
+function bagMesh() {
+  const g = new T3.Group();
+  const b = part(SPH(0.2, 8, 6), '#2B2B30', 0, 0.17, 0, 0.02); b.scale.set(1, 0.85, 1); g.add(b);
+  g.add(part(geo('knot', () => new T3.ConeGeometry(0.06, 0.1, 6)), '#2B2B30', 0, 0.36, 0, 0.012));
+  return g;
+}
+function spillMesh(type) {
+  const g = new T3.Group();
+  if (type === 'liquid') { // a blue puddle, a shine and the cup that made it
+    const sh = new T3.Shape();
+    for (let i = 0; i < 12; i++) {
+      const a = i / 12 * Math.PI * 2, r = 0.3 + rng() * 0.12, x = Math.cos(a) * r, y = Math.sin(a) * r;
+      if (i) sh.lineTo(x, y); else sh.moveTo(x, y);
+    }
+    const m = new T3.Mesh(new T3.ShapeGeometry(sh), new T3.MeshPhongMaterial({ color: COL.spill, transparent: true, opacity: 0.88, shininess: 120, specular: '#FFFFFF' }));
+    m.rotation.x = -Math.PI / 2; m.position.y = 0.012; g.add(m);
+    const shine = new T3.Mesh(geo('shine', () => new T3.CircleGeometry(0.08, 10)), new T3.MeshBasicMaterial({ color: '#FFFFFF', transparent: true, opacity: 0.8 }));
+    shine.rotation.x = -Math.PI / 2; shine.position.set(-0.08, 0.014, -0.06); shine.scale.set(1.6, 0.6, 1); g.add(shine);
+    const cup = part(CYL(0.06, 0.045, 0.15, 8), '#FFFFFF', 0.2, 0.06, 0.12, 0.014); cup.rotation.z = Math.PI / 2; g.add(cup);
+  } else { // trash spilling out of a full bin
+    const cols = ['#FFFFFF', '#E9E4D8', '#D8E6F0', '#F3D6E6'];
+    for (let i = 0; i < 6; i++) {
+      const p = part(BOX(0.12, 0.02, 0.09), cols[i % 4], (rng() - 0.5) * 0.5, 0.02, (rng() - 0.5) * 0.5, 0.012);
+      p.rotation.y = rng() * 3; g.add(p);
+    }
+  }
+  const ring = new T3.Mesh(geo('ring', () => new T3.RingGeometry(0.44, 0.52, 24)), HL_MAT);
+  ring.rotation.x = -Math.PI / 2; ring.position.y = 0.018; ring.visible = false; g.add(ring); g.userData.ring = ring;
+  return g;
+}
+function frameMesh(w, d, t = 0.06) { // a yellow rectangle: what you are about to use
+  const g = new T3.Group();
+  for (const s of [-1, 1]) {
+    const a = new T3.Mesh(BOX(w + t, t, t), HL_MAT); a.position.z = s * d / 2; g.add(a);
+    const b = new T3.Mesh(BOX(t, t, d + t), HL_MAT); b.position.x = s * w / 2; g.add(b);
+  }
+  return g;
+}
+function canvasTex(w, h, draw) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h; draw(c.getContext('2d'), w, h);
+  const t = new T3.CanvasTexture(c); t.colorSpace = T3.SRGBColorSpace; t.anisotropy = 4; return t;
+}
+function signPlate(label, bg, fg, w, h) {
+  const tex = canvasTex(512, Math.round(512 * h / w), (g, cw, ch) => {
+    g.fillStyle = bg; g.fillRect(0, 0, cw, ch); g.lineWidth = 14; g.strokeStyle = '#111111'; g.strokeRect(7, 7, cw - 14, ch - 14);
+    g.fillStyle = fg; g.font = `bold ${Math.round(ch * 0.56)}px ${FONT}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillText(label, cw / 2, ch * 0.54);
+  });
+  return new T3.Mesh(new T3.PlaneGeometry(w, h), new T3.MeshBasicMaterial({ map: tex }));
+}
+
+// ---- Building the store ----------------------------------------------------------------------
+const store = { neon: null, star: null, door: [], doorOpen: 0, gate: null, gateOpen: 0 };
+function addLights(sc) {
+  sc.add(new T3.HemisphereLight('#FFFFFF', '#B9A6C6', 2.3));
+  const d = new T3.DirectionalLight('#FFF1E0', 1.7); d.position.set(4, 14, 12); d.target.position.set(10, 0, 6);
+  sc.add(d, d.target);
+}
+function buildStore() {
+  const S = world3, add = m => { S.add(m); return m; };
+  // glossy white tiles
+  const tex = canvasTex(256, 256, g => {
+    g.fillStyle = '#F1F0F5'; g.fillRect(0, 0, 256, 256);
+    g.fillStyle = '#E6E4EC'; g.fillRect(0, 0, 128, 128); g.fillRect(128, 128, 128, 128);
+    g.strokeStyle = '#CFCAD8'; g.lineWidth = 4;
+    for (const p of [0, 128, 256]) { g.beginPath(); g.moveTo(p, 0); g.lineTo(p, 256); g.moveTo(0, p); g.lineTo(256, p); g.stroke(); }
+  });
+  tex.wrapS = tex.wrapT = T3.RepeatWrapping; tex.repeat.set(9.3, 5.8);
+  const floor = add(new T3.Mesh(new T3.PlaneGeometry(18.6, 11.6), new T3.MeshPhongMaterial({ map: tex, shininess: 80, specular: '#77778A' })));
+  floor.rotation.x = -Math.PI / 2; floor.position.set(10, 0, 6.5);
+  const flat = (w, d, x, z, m, y = 0.003) => { const p = add(new T3.Mesh(new T3.PlaneGeometry(w, d), m)); p.rotation.x = -Math.PI / 2; p.position.set(x, y, z); return p; };
+  flat(18, 3, 10, 2.5, mat('#CBC6D1'));          // storeroom concrete
+  flat(5, 5, 16.5, 9.5, mat('#DCD8E1'));         // behind the counter
+  flat(2, 1, 3, 12.5, mat('#3B3540'));           // door mat
+  const stripes = canvasTex(128, 128, g => {
+    g.fillStyle = COL.yel; g.fillRect(0, 0, 128, 128); g.strokeStyle = '#111111'; g.lineWidth = 16;
+    for (let i = -128; i < 256; i += 44) { g.beginPath(); g.moveTo(i, 128); g.lineTo(i + 128, 0); g.stroke(); }
+  });
+  flat(1, 1, 18.5, 6.5, new T3.MeshLambertMaterial({ map: stripes }), 0.004); // the counter's gate
+  // the fluorescent tubes mirrored in the shiny floor: the 24-hour gloss
+  const glow = new T3.MeshBasicMaterial({ color: '#FFFFFF', transparent: true, opacity: 0.95 });
+  const halo = new T3.MeshBasicMaterial({ color: '#FFFFFF', transparent: true, opacity: 0.4 });
+  for (const [x, z] of [[4.5, 7.55], [10, 8.55], [4.5, 10.55], [9.5, 10.55], [16.5, 8.55], [10, 2.55]]) {
+    flat(2.5, 0.36, x, z, halo, 0.005); flat(2.3, 0.1, x, z, glow, 0.006);
+  }
+  // walls: magenta, drawn thin at the inner edge of their tiles so from above their tops stay a
+  // line, with the yellow band painted along the top of their inner faces; a low magenta facade
+  const wall = (w, h, d, x, y, z, c = COL.wall, ol = 0.03) => add(part(BOX(w, h, d), c, x, y, z, ol));
+  const T = 0.3;
+  wall(18.6, 2.3, T, 10, 1.15, 1 - T / 2, COL.mag);
+  wall(18.6, 0.4, 0.04, 10, 2.1, 1.02, COL.yel, 0);
+  wall(T, 1.3, 11.6, 1 - T / 2, 0.65, 6.5, COL.mag); wall(T, 1.3, 11.6, 19 + T / 2, 0.65, 6.5, COL.mag);
+  wall(0.04, 0.3, 11.3, 1.02, 1.15, 6.65, COL.yel, 0); wall(0.04, 0.3, 11.3, 18.98, 1.15, 6.65, COL.yel, 0);
+  wall(1.3, 0.3, T, 1.35, 0.15, 12 + T / 2, COL.mag); wall(15.3, 0.3, T, 11.65, 0.15, 12 + T / 2, COL.mag);
+  const glass = new T3.MeshLambertMaterial({ color: '#CFEAFF', transparent: true, opacity: 0.16, depthWrite: false });
+  add(new T3.Mesh(BOX(15.3, 0.4, 0.04), glass)).position.set(11.65, 0.5, 12.15);
+  add(new T3.Mesh(BOX(1.3, 0.4, 0.04), glass)).position.set(1.35, 0.5, 12.15);
+  for (const s of [-1, 1]) { // sliding doors
+    const d = new T3.Group(); d.position.set(3 + s * 0.5, 0, 12.25);
+    const pane = new T3.Mesh(BOX(0.96, 1.0, 0.04), glass); pane.position.y = 0.5; d.add(pane);
+    d.add(part(BOX(0.98, 0.06, 0.06), COL.mag, 0, 1.02, 0, 0));
+    d.add(part(BOX(0.06, 1.02, 0.06), COL.mag, s * 0.47, 0.51, 0, 0));
+    add(d); store.door.push({ g: d, s, x0: d.position.x });
+  }
+  // the low wall to the storeroom, with a plastic strip curtain in its doorway
+  wall(5, 0.6, 0.5, 3.5, 0.3, 4.5); wall(11, 0.6, 0.5, 13.5, 0.3, 4.5);
+  wall(5, 0.08, 0.56, 3.5, 0.64, 4.5, COL.mag, 0); wall(11, 0.08, 0.56, 13.5, 0.64, 4.5, COL.mag, 0);
+  const strip = new T3.MeshLambertMaterial({ color: '#BFE3F5', transparent: true, opacity: 0.35, depthWrite: false });
+  for (let i = 0; i < 6; i++) add(new T3.Mesh(BOX(0.3, 0.8, 0.02), strip)).position.set(6.17 + i * 0.33, 0.6, 4.5);
+  add(part(BOX(2.1, 0.07, 0.07), COL.steel, 7, 1.02, 4.5, 0.012));
+  // the neon sign: magenta tubes with a yellow glow, on a dark plate leaning toward the camera
+  const neonTex = canvasTex(1024, 256, (g, w, h) => {
+    g.font = `bold 150px ${FONT}`; g.textAlign = 'center'; g.textBaseline = 'middle'; g.lineJoin = 'round';
+    g.shadowColor = COL.yel; g.shadowBlur = 26; g.lineWidth = 22; g.strokeStyle = COL.yel; g.strokeText('24 HORAS', w / 2, h / 2 + 6);
+    g.shadowColor = COL.mag; g.shadowBlur = 30; g.lineWidth = 12; g.strokeStyle = COL.mag; g.strokeText('24 HORAS', w / 2, h / 2 + 6);
+    g.shadowBlur = 0; g.fillStyle = '#FFD7F0'; g.fillText('24 HORAS', w / 2, h / 2 + 6);
+  });
+  const starTex = canvasTex(256, 256, g => {
+    g.beginPath();
+    for (let i = 0; i < 10; i++) { const a = -Math.PI / 2 + i * Math.PI / 5, r = i % 2 ? 44 : 100; g.lineTo(128 + Math.cos(a) * r, 136 + Math.sin(a) * r); }
+    g.closePath(); g.lineJoin = 'round';
+    g.shadowColor = COL.yel; g.shadowBlur = 28; g.lineWidth = 16; g.strokeStyle = COL.yel; g.stroke();
+    g.shadowBlur = 0; g.lineWidth = 6; g.strokeStyle = '#FFFBD0'; g.stroke();
+  });
+  const sign = new T3.Group(); sign.position.set(10, 1.6, 1.4); sign.rotation.x = -0.42; add(sign);
+  sign.add(part(BOX(7.4, 1.5, 0.1), COL.plum, 0, 0, -0.06, 0.03));
+  store.neon = new T3.MeshBasicMaterial({ map: neonTex, transparent: true });
+  const np = new T3.Mesh(new T3.PlaneGeometry(6.6, 1.65), store.neon); np.position.z = 0.01; sign.add(np);
+  store.star = new T3.MeshBasicMaterial({ map: starTex, transparent: true });
+  for (const s of [-1, 1]) { const p = new T3.Mesh(new T3.PlaneGeometry(1.1, 1.1), store.star); p.position.set(s * 3.15, 0, 0.012); sign.add(p); }
+  // small signs: the till, the pickup, the storeroom
+  const hang = (label, bg, fg, x, y, z, w = 0.95) => {
+    const g = new T3.Group(); g.position.set(x, y, z); g.rotation.x = -0.5; add(g);
+    g.add(signPlate(label, bg, fg, w, 0.32)); g.add(part(BOX(w + 0.05, 0.37, 0.04), '#111111', 0, 0, -0.025, 0));
+    return g;
+  };
+  hang('CAJAS', COL.mag, '#FFFFFF', 13.5, 1.5, 10.0); add(part(CYL(0.02, 0.02, 0.6, 6), COL.steel, 13.5, 1.17, 10.0, 0));
+  hang('ENTREGA', COL.yel, '#111111', 13.5, 1.62, 8.5); add(part(CYL(0.02, 0.02, 0.3, 6), COL.steel, 13.5, 1.47, 8.5, 0));
+  hang('ALMACÉN', COL.mag, '#FFFFFF', 7, 1.3, 4.45, 1.2);
+  // the counter's half door
+  const gate = new T3.Group(); gate.position.set(19, 0, 6.5); add(gate);
+  gate.add(part(BOX(0.92, 0.55, 0.06), COL.mag, -0.48, 0.5, 0, 0.018));
+  store.gate = gate;
+  for (const row of FIX) for (const f of row) if (f) buildFixture(f);
+  for (const p of PRODS) (shelves[p].fridge ? buildFridge : buildGondola)(shelves[p]);
+  for (let z = 0; z < GH; z++) for (let x = 0; x < GW; x++) {
+    const c = MAP[z][x];
+    if (c === 's') buildRack(x, z); else if (c === 'd') buildBackCounter(x, z); else if (c === 'f') buildIceCream(x, z);
+  }
+}
+function candyRack(g) { // slanted wire trays of sweets on the customer side of a counter (its -x face)
+  const cols = ['#E8541E', '#2D5FD0', '#2EB872', '#9B5DE5', '#F28C28', '#D93A3A', '#FFFFFF'];
+  [0.22, 0.5].forEach((y, row) => {
+    const tray = part(BOX(0.18, 0.025, 0.86), COL.metalDark, -0.58, y, 0, 0); tray.rotation.z = -0.35; g.add(tray);
+    g.add(part(BOX(0.02, 0.06, 0.86), COL.mag, -0.66, y - 0.01, 0, 0)); // the price strip
+    for (let i = 0; i < 6; i++) {
+      const b = part(BOX(0.07, 0.03, 0.11), cols[(i * 3 + row * 2) % cols.length], -0.58, y + 0.03, -0.35 + i * 0.14, 0.008);
+      b.rotation.z = -0.35; g.add(b);
+    }
+  });
+}
+function screenTex(food) { // a digital menu board: the food, its name and price, no brand
+  return canvasTex(256, 160, (g, w, h) => {
+    g.fillStyle = '#1B1E26'; g.fillRect(0, 0, w, h);
+    g.fillStyle = COL.mag; g.fillRect(0, 0, w, 34);
+    g.fillStyle = '#FFFFFF'; g.font = `bold 22px ${FONT}`; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillText('MENÚ CALIENTE', w / 2, 18);
+    g.font = `bold 24px ${FONT}`; g.fillText(FOOD_NAME[food], w / 2, 64);
+    g.fillStyle = COL.yel; g.font = `bold 40px ${FONT}`; g.fillText(soles(price(food)), w / 2, 112);
+    g.strokeStyle = COL.yel; g.lineWidth = 6; g.strokeRect(3, 3, w - 6, h - 6);
+  });
+}
+function buildBackCounter(x, z) { // the cabinet behind the tills: a microwave, cups, a menu screen on the wall
+  const g = new T3.Group(); g.position.set(x + 0.5, 0, z + 0.5);
+  g.add(part(BOX(0.9, 0.86, 0.94), COL.top, 0, 0.43, 0, 0.02));
+  g.add(part(BOX(0.94, 0.05, 0.98), COL.metal, 0, 0.885, 0, 0.012));
+  if (z % 2 === 0) { // microwave, door toward the cashier
+    g.add(part(BOX(0.5, 0.3, 0.44), '#D7DAE0', 0.05, 1.06, 0, 0.016));
+    g.add(part(BOX(0.02, 0.2, 0.28), '#1B1E26', -0.205, 1.06, -0.04, 0));
+  } else { // stacks of paper cups and a napkin box
+    for (const [dz, n] of [[-0.25, 5], [-0.05, 4]]) for (let i = 0; i < n; i++) g.add(part(CYL(0.06, 0.045, 0.06, 8), '#FFFFFF', 0.1, 0.94 + i * 0.05, dz, 0.008));
+    g.add(part(BOX(0.22, 0.14, 0.16), COL.mag, 0.05, 0.98, 0.25, 0.012));
+  }
+  const board = new T3.Mesh(new T3.PlaneGeometry(0.86, 0.54), new T3.MeshBasicMaterial({ map: screenTex(z % 2 === 0 ? 'empanada' : 'hamburguesa') }));
+  board.position.set(0.42, 1.25, 0); board.rotation.y = -Math.PI / 2 + 0.45; g.add(board);
+  world3.add(g);
+}
+function buildIceCream(x, z) { // an ice-cream chest by the door, for the look only
+  const g = new T3.Group(); g.position.set(x + 0.5, 0, z + 0.5);
+  g.add(part(BOX(0.92, 0.62, 0.8), '#F4F6FA', 0, 0.31, 0, 0.022));
+  g.add(part(BOX(0.93, 0.16, 0.81), '#2F78C8', 0, 0.42, 0, 0));
+  const cols = ['#F49AC1', '#7B4B2A', '#8FD694', '#FFFFFF', '#F7A23A', '#C77DFF'];
+  for (let i = 0; i < 6; i++) g.add(part(BOX(0.08, 0.04, 0.22), cols[i], -0.3 + i * 0.12, 0.65, (i % 2) * 0.1 - 0.05, 0.008));
+  const lid = new T3.Mesh(BOX(0.94, 0.04, 0.82), new T3.MeshLambertMaterial({ color: '#DFF3FF', transparent: true, opacity: 0.35, depthWrite: false })); lid.position.y = 0.66; g.add(lid);
+  const sign = signPlate('HELADOS', '#2F78C8', '#FFFFFF', 0.8, 0.22); sign.position.set(0, 0.26, 0.41); g.add(sign);
+  world3.add(g);
+}
+function buildFixture(f) {
+  const g = new T3.Group(); g.position.set(f.x + 0.5, 0, f.z + 0.5);
+  const add = m => { g.add(m); return m; };
+  switch (f.type) {
+    case 'crate': { // a pallet of boxes, banded in the product's colour, one on top to show it
+      add(part(BOX(0.9, 0.08, 0.8), '#9A7650', 0, 0.04, 0, 0.015));
+      add(part(BOX(0.8, 0.36, 0.66), COL.card, 0, 0.26, 0, 0.02));
+      add(part(BOX(0.81, 0.08, 0.67), PROD[f.prod].color, 0, 0.26, 0, 0));
+      add(part(BOX(0.66, 0.3, 0.56), COL.card, 0.03, 0.59, 0.02, 0.02));
+      add(part(BOX(0.67, 0.07, 0.57), PROD[f.prod].color, 0.03, 0.59, 0.02, 0));
+      add(part(BOX(0.67, 0.015, 0.12), '#E9D7AE', 0.03, 0.745, 0.02, 0));
+      const p = productMesh(f.prod); p.position.set(0.03, 0.75, 0.02); p.scale.setScalar(tune.product_scale); add(p);
+      break;
+    }
+    case 'freezer': {
+      add(part(BOX(0.92, 0.7, 0.82), '#EEF3F8', 0, 0.35, 0, 0.025));
+      add(part(BOX(0.93, 0.1, 0.83), '#59A8E6', 0, 0.52, 0, 0));
+      add(part(BOX(0.94, 0.06, 0.84), '#BCE3F8', 0, 0.73, 0, 0.018));
+      for (const s of [-1, 1]) {
+        const m = foodMesh(f.food); paintFood(m, f.food, 0);
+        m.position.set(s * 0.2, 0.76, s * 0.08); m.scale.setScalar(1.5); m.rotation.y = s; add(m);
+      }
+      break;
+    }
+    case 'mopstand': {
+      add(part(CYL(0.22, 0.17, 0.32, 10), '#2F78C8', 0, 0.16, 0, 0.02));
+      add(part(CYL(0.19, 0.19, 0.02, 10), '#8FD6F2', 0, 0.31, 0, 0));
+      add(part(BOX(0.32, 0.06, 0.1), '#9DA2AE', 0, 0.34, -0.12, 0.012));
+      break;
+    }
+    case 'dumpster': {
+      add(part(BOX(0.92, 0.74, 0.8), '#2F6E4C', 0, 0.45, 0, 0.025));
+      const lid = add(part(BOX(0.96, 0.07, 0.84), '#245A3D', 0, 0.85, 0, 0.02)); lid.rotation.x = -0.08;
+      for (const sx of [-0.35, 0.35]) for (const sz of [-0.3, 0.3]) { const w = add(part(CYL(0.06, 0.06, 0.05, 8), COL.ink, sx, 0.06, sz, 0)); w.rotation.z = Math.PI / 2; }
+      break;
+    }
+    case 'counter': case 'register': {
+      add(part(BOX(1, 0.8, 1), COL.mag, 0, 0.4, 0, 0.02));
+      add(part(BOX(1.01, 0.1, 1.01), '#5E0A44', 0, 0.05, 0, 0));
+      add(part(BOX(1.0, 0.07, 1.0), COL.top, 0, 0.835, 0, 0));
+      if (f.x === 13 && !f.pickup) candyRack(g); // sweets on the customer side, as at the store's tills
+      if (f.pickup) { // the hot-food case: glass on a steel frame, a warm lamp under its roof
+        add(part(BOX(0.96, 0.05, 0.9), COL.metal, 0, 0.895, 0, 0));
+        add(new T3.Mesh(BOX(0.92, 0.38, 0.86), new T3.MeshLambertMaterial({ color: '#FFF4E0', transparent: true, opacity: 0.2, depthWrite: false }))).position.y = 1.11;
+        for (const sx of [-0.46, 0.46]) for (const sz of [-0.42, 0.42]) add(part(BOX(0.035, 0.4, 0.035), COL.metal, sx, 1.11, sz, 0));
+        add(part(BOX(0.98, 0.05, 0.92), COL.top, 0, 1.325, 0, 0.012));
+        add(part(BOX(0.86, 0.015, 0.78), mat('#FFD38A', { emissive: '#FFB347' }), 0, 1.295, 0, 0));
+      }
+      if (f.type === 'register') { // the till faces the cashier, a small screen faces the customer
+        add(part(BOX(0.5, 0.16, 0.42), '#3B3742', 0.05, 0.95, 0, 0.02));
+        add(part(BOX(0.04, 0.24, 0.34), '#1B1E26', 0.22, 1.12, 0, 0.015));
+        add(part(BOX(0.01, 0.18, 0.28), mat('#7CF0D8', { emissive: '#3FBFA8' }), 0.245, 1.12, 0, 0));
+        add(part(BOX(0.04, 0.1, 0.18), '#1B1E26', -0.2, 1.06, 0, 0.012));
+      }
+      break;
+    }
+    case 'oven': { // open-fronted so the food shows through the window
+      const O = COL.oven, y0 = 0.45, hgt = 0.6;
+      add(part(BOX(0.9, 0.42, 0.9), COL.steel, 0, 0.21, 0, 0.02));
+      add(part(BOX(0.88, 0.07, 0.88), O, 0, y0 + 0.035, 0, 0.02));
+      add(part(BOX(0.88, 0.08, 0.88), O, 0, y0 + hgt - 0.04, 0, 0.02));
+      add(part(BOX(0.08, hgt, 0.88), O, 0.4, y0 + hgt / 2, 0, 0.02));
+      for (const s of [-1, 1]) add(part(BOX(0.88, hgt, 0.07), O, 0, y0 + hgt / 2, s * 0.405, 0.02));
+      f.glow = new T3.MeshBasicMaterial({ color: '#4A2412' });
+      add(new T3.Mesh(BOX(0.02, 0.42, 0.7), f.glow)).position.set(0.35, y0 + 0.3, 0);
+      add(new T3.Mesh(BOX(0.03, 0.44, 0.74), new T3.MeshLambertMaterial({ color: '#FFB070', transparent: true, opacity: 0.22, depthWrite: false }))).position.set(-0.43, y0 + 0.3, 0);
+      add(part(BOX(0.05, 0.08, 0.88), '#3B3742', -0.44, y0 + hgt - 0.04, 0, 0));
+      g.rotation.y = Math.PI / 2; // its window faces the shop (and the camera)
+      break;
+    }
+    case 'display': { // the cold case beside the tills: a row per food, lit cold blue
+      add(part(BOX(1, 0.8, 1), COL.mag, 0, 0.4, 0, 0.02));
+      add(part(BOX(1.01, 0.1, 1.01), '#5E0A44', 0, 0.05, 0, 0));
+      add(part(BOX(1.0, 0.07, 1.0), COL.top, 0, 0.835, 0, 0));
+      add(part(BOX(0.96, 0.04, 0.92), '#E8F4FF', 0, 0.89, 0, 0));
+      add(new T3.Mesh(BOX(0.94, 0.42, 0.9), new T3.MeshLambertMaterial({ color: '#DDF3FF', transparent: true, opacity: 0.18, depthWrite: false }))).position.y = 1.12;
+      for (const sx of [-0.47, 0.47]) for (const sz of [-0.44, 0.44]) add(part(BOX(0.035, 0.44, 0.035), COL.metal, sx, 1.12, sz, 0));
+      add(new T3.Mesh(BOX(0.98, 0.03, 0.94), new T3.MeshLambertMaterial({ color: '#DDF3FF', transparent: true, opacity: 0.25, depthWrite: false }))).position.y = 1.35; // glass roof: the food shows
+      for (const sz of [-0.46, 0.46]) add(part(BOX(0.98, 0.04, 0.03), COL.metal, 0, 1.35, sz, 0));
+      add(new T3.Mesh(BOX(0.9, 0.05, 0.03), new T3.MeshBasicMaterial({ color: '#CFEFFF' }))).position.set(0, 1.3, -0.43); // the cold lamp
+      const label = signPlate('VITRINA FRÍA', '#2F78C8', '#FFFFFF', 0.92, 0.22); label.position.set(0, 0.55, 0.512); g.add(label);
+      FOODS.forEach((food, r) => {
+        f.slots[food] = [];
+        for (let i = 0; i < tune.display_cap; i++) {
+          const m = foodMesh(food); paintFood(m, food, 0); m.scale.setScalar(0.85);
+          m.position.set(-0.3 + i * 0.6 / Math.max(1, tune.display_cap - 1), 0.91, -0.3 + r * 0.3); g.add(m); f.slots[food].push(m);
+        }
+      });
+      break;
+    }
+    case 'bin': {
+      add(part(CYL(0.3, 0.25, 0.7, 12), '#5F7A6C', 0, 0.35, 0, 0.025));
+      add(part(CYL(0.305, 0.3, 0.06, 12), '#4A6356', 0, 0.55, 0, 0));
+      const lid = new T3.Group(); lid.position.set(0, 0.72, -0.3); g.add(lid);
+      lid.add(part(CYL(0.32, 0.32, 0.05, 12), '#3F5549', 0, 0, 0.3, 0.018)); f.lid = lid;
+      const papers = new T3.Group(); papers.position.y = 0.72; g.add(papers); f.papers = papers;
+      [['#FFFFFF', -0.1, 0.05], ['#E9E4D8', 0.12, -0.05], ['#D8E6F0', 0.0, 0.1], ['#F3D6E6', -0.05, -0.12]].forEach(([c, x, z], i) => {
+        const p = part(BOX(0.16, 0.05, 0.12), c, x, 0.03 + i * 0.02, z, 0.012); p.rotation.set(0.3 * i, i, 0.2); papers.add(p);
+      });
+      add(part(BOX(0.16, 0.03, 0.1), '#2C2C2C', 0, 0.03, 0.32, 0));
+      break;
+    }
+    default: return;
+  }
+  world3.add(g); f.mesh = g;
+}
+function buildGondola(sh) {
+  // gray wire shelving with magenta price strips and a sign on top naming what it holds
+  const g = new T3.Group(); g.position.set(sh.cx, 0, sh.cz); const L = sh.w;
+  const wire = canvasTex(128, 64, (c, w, h) => {
+    c.fillStyle = '#C9CDD5'; c.fillRect(0, 0, w, h); c.strokeStyle = '#8D93A0'; c.lineWidth = 3;
+    for (let i = 0; i <= w; i += 16) { c.beginPath(); c.moveTo(i, 0); c.lineTo(i, h); c.stroke(); }
+    for (let i = 0; i <= h; i += 16) { c.beginPath(); c.moveTo(0, i); c.lineTo(w, i); c.stroke(); }
+  });
+  wire.wrapS = wire.wrapT = T3.RepeatWrapping; wire.repeat.set(L, 1);
+  g.add(part(BOX(L - 0.04, 0.12, 0.84), COL.metalDark, 0, 0.06, 0, 0.02));
+  g.add(part(BOX(L - 0.1, 0.82, 0.06), new T3.MeshLambertMaterial({ map: wire }), 0, 0.5, 0, 0.02));
+  for (const y of [0.36, 0.7]) g.add(part(BOX(L - 0.08, 0.04, 0.8), COL.metal, 0, y, 0, 0.012));
+  for (const s of [-1, 1]) for (const z of [-0.4, 0.4]) g.add(part(BOX(0.06, 1.0, 0.06), COL.metalDark, s * (L / 2 - 0.04), 0.5, z, 0.012));
+  for (const s of [-1, 1]) for (const y of [0.33, 0.68]) g.add(part(BOX(L - 0.1, 0.05, 0.02), COL.mag, 0, y, s * 0.41, 0));
+  const sign = new T3.Group(); sign.position.set(0, 1.34, 0.02); sign.rotation.x = -0.45; g.add(sign);
+  sign.add(signPlate(PROD[sh.prod].name.toUpperCase(), COL.mag, '#FFFFFF', 1.3, 0.3));
+  g.add(part(BOX(0.04, 0.3, 0.04), COL.metalDark, 0, 1.1, 0, 0));
+  const k = Math.ceil(sh.cap / 2);
+  for (let i = 0; i < sh.cap; i++) { // the front row fills first, so it empties last
+    const side = i < k ? 1 : -1, j = i < k ? i : i - k;
+    const p = productMesh(sh.prod); p.scale.setScalar(tune.product_scale);
+    p.position.set(-L / 2 + 0.38 + j * (L - 0.76) / Math.max(1, k - 1), 0.72, side * 0.22); g.add(p); sh.slots.push(p);
+  }
+  sh.alert = frameMesh(L + 0.1, 0.98); sh.alert.position.y = 1.0; sh.alert.visible = false; g.add(sh.alert);
+  world3.add(g);
+}
+function buildFridge(sh) { // glass doors in black frames, lit cold blue inside; it faces the shop (+x)
+  const g = new T3.Group(); g.position.set(sh.cx, 0, sh.cz); const L = sh.d, F = '#2E2C34';
+  g.add(part(BOX(0.12, 1.75, L - 0.04), F, -0.38, 0.875, 0, 0.025));
+  g.add(part(BOX(0.9, 0.14, L - 0.04), F, 0, 1.68, 0, 0.025));
+  g.add(part(BOX(0.9, 0.16, L - 0.04), F, 0, 0.08, 0, 0.025));
+  for (const s of [-1, 1]) g.add(part(BOX(0.9, 1.75, 0.1), F, 0, 0.875, s * (L / 2 - 0.07), 0.025));
+  const light = new T3.Mesh(BOX(0.02, 1.4, L - 0.25), new T3.MeshBasicMaterial({ color: '#CFEFFF' })); light.position.set(-0.31, 0.88, 0); g.add(light); // cold light
+  for (const y of [0.42, 0.86, 1.3]) g.add(part(BOX(0.6, 0.03, L - 0.25), '#E8F4FF', 0, y, 0, 0));
+  for (let i = 0; i <= 4; i++) g.add(part(BOX(0.05, 1.45, 0.06), COL.black, 0.44, 0.88, -L / 2 + 0.1 + i * (L - 0.2) / 4, 0));
+  for (let i = 0; i < 4; i++) g.add(part(BOX(0.03, 0.5, 0.03), COL.metal, 0.47, 0.95, -L / 2 + 0.1 + (i + 0.82) * (L - 0.2) / 4, 0)); // door handles
+  const glassF = new T3.Mesh(BOX(0.03, 1.4, L - 0.15), new T3.MeshLambertMaterial({ color: '#CDEBFF', transparent: true, opacity: 0.12, depthWrite: false }));
+  glassF.position.set(0.44, 0.88, 0); g.add(glassF);
+  const top = signPlate('BEBIDAS', COL.mag, '#FFFFFF', 1.6, 0.3); top.position.set(0.46, 1.66, 0); top.rotation.y = Math.PI / 2; g.add(top);
+  const per = sh.cap / 2, bottles = ['#D93A3A', '#2EB872', '#F28C28', '#2A7DE1', '#E9C46A', '#9B5DE5', '#D93A3A', '#2EB872'];
+  for (let i = 0; i < sh.cap; i++) { // the top row fills first
+    const row = i < per ? 0 : 1, j = i < per ? i : i - per;
+    const slot = new T3.Group(); slot.position.set(0.05, row ? 0.45 : 0.89, -L / 2 + 0.5 + j * (L - 1) / Math.max(1, per - 1));
+    for (const dz of [-0.14, 0.14]) { const b = productMesh('bebidas', bottles[i % bottles.length]); b.position.z = dz; b.scale.setScalar(Math.min(1.8, tune.product_scale)); slot.add(b); }
+    g.add(slot); sh.slots.push(slot);
+  }
+  sh.alert = frameMesh(0.98, L + 0.06); sh.alert.position.y = 1.78; sh.alert.visible = false; g.add(sh.alert);
+  world3.add(g);
+}
+function buildRack(x, z) { // storeroom shelving with boxes, for the look only
+  const g = new T3.Group(); g.position.set(x + 0.5, 0, z + 0.5);
+  for (const sx of [-0.42, 0.42]) for (const sz of [-0.36, 0.36]) g.add(part(BOX(0.05, 1.4, 0.05), COL.steel, sx, 0.7, sz, 0.012));
+  const k = (x * 7 + z * 3) % 4;
+  [0.3, 0.75, 1.2].forEach((y, i) => {
+    g.add(part(BOX(0.9, 0.04, 0.78), '#C9CDD6', 0, y, 0, 0.012));
+    const w = 0.3 + ((k + i) % 3) * 0.1;
+    g.add(part(BOX(w, 0.24, 0.5), COL.card, -0.18 + ((k + i) % 2) * 0.3, y + 0.14, 0, 0.018));
+  });
+  world3.add(g);
+}
+// The camera: fixed, tilted camera_tilt degrees down from the front, fitted so the whole store shows under the
+// HUD's top bar at any window shape (the logical view is always 16:9).
+function frameCamera() {
+  const elev = tune.camera_tilt * Math.PI / 180, TOP = 0.74, BOT = -0.96;
+  const pts = [[0.6, 0, 0.6], [19.4, 0, 0.6], [0.6, 0, 13], [19.4, 0, 13], [0.6, 2.3, 0.7], [19.4, 2.3, 0.7], [0.6, 1.3, 12], [19.4, 1.3, 12]];
+  let tz = 6.5, d = 20;
+  const place = () => { camera.position.set(10, Math.sin(elev) * d, tz + Math.cos(elev) * d); camera.lookAt(10, 0, tz); camera.updateMatrixWorld(true); };
+  const range = () => {
+    let x0 = 9, x1 = -9, y0 = 9, y1 = -9;
+    for (const [x, y, z] of pts) { V3.set(x, y, z).project(camera); x0 = Math.min(x0, V3.x); x1 = Math.max(x1, V3.x); y0 = Math.min(y0, V3.y); y1 = Math.max(y1, V3.y); }
+    return { x0, x1, y0, y1 };
+  };
+  for (let it = 0; it < 10; it++) {
+    for (d = 8; d < 60; d += 0.05) { place(); const r = range(); if (r.x1 - r.x0 <= 1.96 && r.y1 - r.y0 <= TOP - BOT) break; }
+    const r = range(); tz -= ((r.y0 + r.y1) / 2 - (TOP + BOT) / 2) * 3;
+  }
+  place();
+}
+function initThree() {
+  if (!T3) return;
+  try { renderer = new T3.WebGLRenderer({ canvas: worldCanvas, antialias: !CHEAP }); }
+  catch (e) { renderer = null; events.push({ type: 'nowebgl' }); return; }
+  renderer.setPixelRatio(CHEAP ? 0.5 : Math.min(2, devicePixelRatio || 1));
+  renderer.setClearColor('#2A0F24');
+  OUT_MAT = new T3.MeshBasicMaterial({ color: '#111111', side: T3.BackSide });
+  SHADOW_MAT = new T3.MeshBasicMaterial({ color: '#2A1030', transparent: true, opacity: 0.22, depthWrite: false });
+  HL_MAT = new T3.MeshBasicMaterial({ color: COL.yel, side: T3.DoubleSide });
+  world3 = new T3.Scene();
+  camera = new T3.PerspectiveCamera(34, W / H, 0.1, 120);
+  addLights(world3);
+  for (const p of PRODS) shelves[p].cap = shelves[p].fridge ? tune.fridge_cap : tune.shelf_cap; // the slots are built from it
+  buildStore();
+  for (const s of ['j1', 'j2', 'bot']) { views[s] = makeWorker(s); views[s].g.visible = false; views[s].g.scale.setScalar(tune.figure_scale); world3.add(views[s].g); }
+  for (let i = 0; i < 2; i++) { const h = { floor: frameMesh(1, 1), top: frameMesh(1, 1) }; h.floor.visible = h.top.visible = false; world3.add(h.floor, h.top); HL.push(h); }
+  frameCamera();
+  fit();
+}
+
+// ---- State ---------------------------------------------------------------------------------
+let scene, state, mode2P = false, animT = 0;
+function newWorker(id, name, isBot, x, z) {
+  return {
+    id, name, isBot, x, z, vx: 0, vz: 0, fx: 0, fz: 1, held: null, down: 0, stun: 0, immune: 0, spin: 0,
+    grabCd: 0, warnT: 0, workKind: null, workP: 0, target: null,
+    stats: { ventas: 0, pedidos: 0, repos: 0, limpiezas: 0, bolsas: 0, ayudas: 0, resbalones: 0, choques: 0, soles: 0 },
+    bot: isBot ? { task: null, think: 0, act: 0, path: null, goalKey: '', repath: 0, stuckT: 0, lastX: x, lastZ: z, jitter: 0, jx: 0, jz: 0, near: null, said: false } : null,
+    view: null,
+  };
+}
+function reset() {
+  seed = Number(params.get('seed')) || CONFIG.seed;
+  if (state && world3) {
+    for (const it of state.items) if (it.mesh) world3.remove(it.mesh);
+    for (const c of state.customers) if (c.view) world3.remove(c.view.g);
+    for (const s of state.spills) if (s.mesh) world3.remove(s.mesh);
+  }
+  if (world3) for (const p of parts) world3.remove(p.m);
+  parts.length = 0;
+  for (const p of PRODS) {
+    const sh = shelves[p];
+    sh.cap = sh.fridge ? tune.fridge_cap : tune.shelf_cap;
+    sh.stock = Math.min(sh.cap, tune['start_' + p]); sh.emptyT = 0; sh.fill = 0;
+  }
+  for (const f of counters) f.item = null;
+  for (const o of ovens) { o.item = null; o.alarmT = 0; }
+  for (const t of tills) t.cust = null;
+  for (const k of FOODS) display.stock[k] = Math.min(tune.display_cap, tune.display_start);
+  display.fill = 0;
+  bin.fill = 0;
+  const p1 = newWorker('p1', 'J1', false, 8.5, 5.5);
+  const p2 = mode2P ? newWorker('p2', 'J2', false, 15.5, 8.5) : newWorker('bot', 'BOT', true, 15.5, 8.5);
+  p2.fx = -1; p2.fz = 0;
+  state = {
+    t: 0, score: 0, money: 0, sat: tune.sat_start, workers: [p1, p2], customers: [], items: [], spills: [], queue: [], pickup: [],
+    phase: 'tut', nextSpawn: 99, scriptIdx: 0, crunchIdx: 0, banner: diff === 'tutorial' ? null : { text: '¡Empieza el turno!', t: 0 }, floaters: [], signal: null,
+    tut: { restock: false, cobro: false, hot: false, mop: false, display: false }, spawned: 0, served: 0, angry: 0, nextId: 1, lastCall: false,
+    stars: 0, resT: 0, gained: '', mop: null, diff, tutor: diff === 'tutorial' ? { i: 0, card: true, base: 0, signaled: false } : null,
+  };
+  state.mop = newItem('mop'); state.mop.place = 'stand';
+  if (world3) {
+    for (const k in views) views[k].g.visible = false;
+    for (const w of state.workers) {
+      w.view = views[w.id === 'p1' ? 'j1' : w.id === 'p2' ? 'j2' : 'bot'];
+      w.view.g.visible = true; w.view.ang = Math.atan2(w.fx, w.fz);
+    }
+  }
+}
+
+// ---- Items ---------------------------------------------------------------------------------
+function newItem(kind, p = {}) {
+  const it = { id: state.nextId++, kind, prod: p.prod || null, food: p.food || null, cook: 0, fill: p.fill || 0, place: 'floor', x: 0, z: 0, rot: 0, holder: null, fix: null, lastBy: null, handoff: 0, fly: null, mesh: null };
+  if (world3) {
+    it.mesh = kind === 'box' ? boxMesh(it.prod) : kind === 'food' ? foodMesh(it.food) : kind === 'foodbox' ? foodBoxMesh(it.food) : kind === 'mop' ? mopMesh() : bagMesh();
+    if (kind !== 'mop') it.mesh.scale.setScalar(tune.item_scale);
+    world3.add(it.mesh);
+  }
+  state.items.push(it); return it;
+}
+function detach(it) {
+  if (it.fix && it.fix.item === it) it.fix.item = null;
+  it.fix = null;
+  if (it.holder && it.holder.held === it) it.holder.held = null;
+  it.holder = null;
+}
+function removeItem(it) {
+  detach(it); if (it.mesh) world3.remove(it.mesh);
+  const i = state.items.indexOf(it); if (i >= 0) state.items.splice(i, 1);
+}
+function holdItem(w, it) { detach(it); it.place = 'held'; it.holder = w; w.held = it; it.lastBy = w.id; sfx.grab(); }
+function setOn(it, place, f, by) {
+  detach(it); it.place = place; it.fix = f || null;
+  if (f && (place === 'counter' || place === 'oven')) f.item = it;
+  if (by) it.lastBy = by.id; sfx.drop();
+}
+function dropOnFloor(it, x, z, by) {
+  detach(it);
+  const t = staffOK(Math.floor(x), Math.floor(z)) ? null : nearestOpen(Math.floor(x), Math.floor(z));
+  it.place = 'floor'; it.x = t ? t[0] + 0.5 : x; it.z = t ? t[1] + 0.5 : z; it.rot = rng() * 6.28;
+  if (by) it.lastBy = by.id; sfx.drop();
+}
+function nearestOpen(x, z) {
+  for (let r = 0; r < 6; r++) for (let dz = -r; dz <= r; dz++) for (let dx = -r; dx <= r; dx++) {
+    if (Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
+    if (staffOK(x + dx, z + dz)) return [x + dx, z + dz];
+  }
+  return [8, 6];
+}
+// Slapstick: whatever you carry flies out in an arc when you slip or bump, and lands on the
+// floor, or on a free counter top if it comes down there.
+function throwItem(it, x, z, dx, dz, dist, by) {
+  let tx = x + dx * dist, tz = z + dz * dist, land = null;
+  const fx = Math.floor(tx), fz = Math.floor(tz), f = fixAt(fx, fz);
+  if (f && f.type === 'counter' && !f.item) land = f;
+  else if (!staffOK(fx, fz)) { const t = nearestOpen(fx, fz); tx = t[0] + 0.5 + (rng() - 0.5) * 0.4; tz = t[1] + 0.5 + (rng() - 0.5) * 0.4; }
+  detach(it);
+  it.place = 'fly';
+  it.fly = { sx: x, sz: z, sy: 0.55, ex: land ? land.x + 0.5 : tx, ez: land ? land.z + 0.5 : tz, ey: land ? 0.87 : 0.01, t: 0, dur: 0.42, land };
+  if (land) land.item = it;
+  if (by) it.lastBy = by.id;
+}
+function itemXZ(it) {
+  if (it.place === 'held') return [it.holder.x, it.holder.z];
+  if (it.place === 'stand') return [mopStand.x + 0.5, mopStand.z + 0.5];
+  if (it.fix) return [it.fix.x + 0.5, it.fix.z + 0.5];
+  if (it.place === 'fly') return [it.fly.ex, it.fly.ez];
+  return [it.x, it.z];
+}
+function addToBin(n) {
+  bin.fill += n;
+  if (bin.fill > tune.bin_cap) { // overflowing: the extra lands on the floor as a mess
+    bin.fill = tune.bin_cap;
+    const spot = [[9, 11], [11, 11], [10, 10]].find(([x, z]) => !state.spills.some(s => Math.floor(s.x) === x && Math.floor(s.z) === z));
+    if (spot) makeSpill(spot[0] + 0.5, spot[1] + 0.5, 'trash');
+  }
+}
+function updateItems(dt) {
+  for (const it of state.items) {
+    if (it.place === 'fly') {
+      const f = it.fly; f.t += dt;
+      if (f.t >= f.dur) {
+        if (f.land) { it.place = 'counter'; it.fix = f.land; f.land.item = it; }
+        else { it.place = 'floor'; it.x = f.ex; it.z = f.ez; it.rot = rng() * 6.28; }
+        it.fly = null; sfx.drop();
+      }
+    }
+    if (it.handoff > 0) it.handoff -= dt;
+  }
+  for (const o of ovens) {
+    const it = o.item; if (!it || it.place !== 'oven') continue;
+    const before = foodState(it); it.cook += dt; const after = foodState(it);
+    if (before !== after && after === 'ready') { sfx.ready(); floater('¡Listo!', o.x + 0.5, 1.6, o.z + 0.5, 'money'); }
+    if (before !== after && after === 'burned') { sfx.burn(); floater('¡Se quemó!', o.x + 0.5, 1.6, o.z + 0.5, 'bad'); events.push({ type: 'burned', t: state.t }); }
+    if (after === 'ready' && it.cook > tune.cook_time + burnTime() * 0.6) { o.alarmT -= dt; if (o.alarmT <= 0) { sfx.alarm(); o.alarmT = 0.4; } }
+    if (after === 'burned' && rng() < dt * 6) puff(o.x + 0.3, 1.1, o.z + 0.5);
+  }
+  checkPickup();
+}
+
+// ---- Workers: walking, bumping, slipping, grabbing and working ---------------------------------
+function keyInput(w) {
+  const k = KEYS[w.id];
+  const mx = (down.has(k.right) ? 1 : 0) - (down.has(k.left) ? 1 : 0);
+  const mz = (down.has(k.down) ? 1 : 0) - (down.has(k.up) ? 1 : 0);
+  return { mx, mz, grab: pressed(k.grab), work: down.has(k.work), signal: pressed(k.signal), face: null };
+}
+function collide(e, r = 0.3) { // push a circle out of solid tiles
+  for (let pass = 0; pass < 2; pass++) {
+    const x0 = Math.floor(e.x - r), x1 = Math.floor(e.x + r), z0 = Math.floor(e.z - r), z1 = Math.floor(e.z + r);
+    for (let z = z0; z <= z1; z++) for (let x = x0; x <= x1; x++) {
+      if (staffOK(x, z)) continue;
+      const px = clamp(e.x, x, x + 1), pz = clamp(e.z, z, z + 1), dx = e.x - px, dz = e.z - pz, d2 = dx * dx + dz * dz;
+      if (d2 >= r * r) continue;
+      if (d2 > 1e-9) { const d = Math.sqrt(d2), push = r - d; e.x += dx / d * push; e.z += dz / d * push; }
+      else {
+        const l = e.x - x, rr = x + 1 - e.x, t = e.z - z, bb = z + 1 - e.z, m = Math.min(l, rr, t, bb);
+        if (m === l) e.x = x - r; else if (m === rr) e.x = x + 1 + r; else if (m === t) e.z = z - r; else e.z = z + 1 + r;
+      }
+    }
+  }
+}
+function updateWorker(w, dt) {
+  w.immune -= dt; w.grabCd -= dt; w.warnT -= dt;
+  if (w.down > 0) { // on the floor, spinning, sliding to a stop
+    w.down -= dt; w.spin += dt * 14 * Math.max(0, w.down / tune.slip_time);
+    const k = Math.max(0, 1 - 2.5 * dt); w.vx *= k; w.vz *= k;
+    w.x += w.vx * dt; w.z += w.vz * dt; collide(w); w.workKind = null;
+    if (w.down <= 0) { w.down = 0; w.immune = tune.slip_immune; }
+    return;
+  }
+  const inp = w.isBot ? botInput(w, dt) : keyInput(w);
+  if (w.stun > 0) {
+    w.stun -= dt; const k = Math.max(0, 1 - 6 * dt); w.vx *= k; w.vz *= k;
+    w.x += w.vx * dt; w.z += w.vz * dt; collide(w); w.workKind = null; return;
+  }
+  let mx = inp.mx, mz = inp.mz; const m = Math.hypot(mx, mz);
+  if (m > 0.01) { mx /= m; mz /= m; w.fx = mx; w.fz = mz; }
+  else { mx = 0; mz = 0; if (inp.face) { w.fx = inp.face[0]; w.fz = inp.face[1]; } }
+  const sp = tune.walk_speed * (w.isBot ? tune.bot_speed : 1), k = Math.min(1, tune.accel * dt);
+  w.vx += (mx * sp - w.vx) * k; w.vz += (mz * sp - w.vz) * k;
+  w.x += w.vx * dt; w.z += w.vz * dt; collide(w);
+  w.target = findTarget(w);
+  if (inp.grab && w.grabCd <= 0) { w.grabCd = 0.15; doGrab(w, w.target); }
+  if (inp.work) doWork(w, w.target, dt); else w.workKind = null;
+  if (inp.signal) placeSignal(w);
+  checkSlip(w);
+}
+// What a worker would use: the fixture in front (or a little to either side), a thing on the
+// floor in reach, a spill in front, a partner on the floor.
+function findTarget(w) {
+  const res = { fx: null, item: null, spill: null, partner: null };
+  for (const o of state.workers) if (o !== w && o.down > 0 && Math.hypot(o.x - w.x, o.z - w.z) < 1.4) res.partner = o;
+  for (const a of [0, 0.6, -0.6]) {
+    const ca = Math.cos(a), sa = Math.sin(a), dx = w.fx * ca - w.fz * sa, dz = w.fx * sa + w.fz * ca;
+    const f = fixAt(Math.floor(w.x + dx * 0.8), Math.floor(w.z + dz * 0.8));
+    if (f && INTERACT.has(f.type)) { res.fx = f; break; }
+  }
+  const px = w.x + w.fx * 0.55, pz = w.z + w.fz * 0.55;
+  let best = 0.75;
+  for (const it of state.items) if (it.place === 'floor') { const d = Math.hypot(it.x - px, it.z - pz); if (d < best) { best = d; res.item = it; } }
+  best = 0.85;
+  for (const s of state.spills) { const d = Math.hypot(s.x - px, s.z - pz); if (d < best) { best = d; res.spill = s; } }
+  return res;
+}
+function say(w, msg, style = 'info') { // a short line over a worker, not repeated every step
+  if (w.warnT > 0) return;
+  w.warnT = 1.0; floater(msg, w.x, 2.1, w.z, style);
+}
+const workKey = w => w.id === 'p2' ? 'L' : 'F';
+function doGrab(w, tg) {
+  const f = tg.fx, held = w.held;
+  if (held) {
+    if (f) {
+      switch (f.type) {
+        case 'oven':
+          if (held.kind === 'food' && COLD(held.food)) { say(w, 'El postre va frío: entrégalo'); sfx.wrong(); return; }
+          if (held.kind === 'food' && !f.item && foodState(held) !== 'burned') { setOn(held, 'oven', f, w); return; }
+          if (held.kind === 'food' && foodState(held) === 'burned') { say(w, 'Quemado: a la basura'); sfx.wrong(); return; }
+          break;
+        case 'bin':
+          if (held.kind === 'food' || held.kind === 'box' || held.kind === 'foodbox') { removeItem(held); addToBin(1); floater('A la basura', f.x + 0.5, 1.3, f.z + 0.5); sfx.drop(); return; }
+          break;
+        case 'dumpster':
+          if (held.kind === 'bag') { removeItem(held); reward(w, 'bolsas', f.x + 0.5, f.z + 0.5); return; }
+          break;
+        case 'mopstand':
+          if (held.kind === 'mop') { setOn(held, 'stand', null, w); return; }
+          break;
+        case 'counter':
+          if (!f.item) {
+            setOn(held, 'counter', f, w);
+            if (w.isBot && held.kind === 'food' && !f.pickup) { held.handoff = 8; held.noHandoff = true; } // left for the partner to cook, once
+            checkPickup(); return;
+          }
+          say(w, 'Ocupado'); sfx.wrong(); return;
+        case 'crate':
+          if (held.kind === 'box' && held.prod === f.prod) { removeItem(held); sfx.drop(); return; }
+          break;
+        case 'freezer':
+          if (held.kind === 'foodbox' && held.food === f.food) { removeItem(held); sfx.drop(); return; }
+          break;
+        case 'display':
+          if (held.kind === 'foodbox') { say(w, `Mantén ${workKey(w)} para reponer`); return; }
+          if (held.kind === 'food' && (COLD(held.food) || held.cook <= 0) && (display.stock[held.food] || 0) < tune.display_cap) {
+            display.stock[held.food]++; removeItem(held); sfx.drop(); return; // put back
+          }
+          break;
+        case 'shelf':
+          if (held.kind === 'box') { say(w, held.prod === f.shelf.prod ? `Mantén ${workKey(w)} para reponer` : '¡Ese no va ahí!'); return; }
+          break;
+      }
+      say(w, 'Aquí no va'); sfx.wrong(); return;
+    }
+    dropOnFloor(held, w.x + w.fx * 0.55, w.z + w.fz * 0.55, w); // nothing in front: set it down
+    return;
+  }
+  if (f) {
+    switch (f.type) {
+      case 'crate': holdItem(w, newItem('box', { prod: f.prod })); return;
+      case 'freezer': holdItem(w, newItem('foodbox', { food: f.food })); return;
+      case 'display': { // the food the most impatient order needs, else whatever is there
+        const kind = displayPick();
+        if (kind) { display.stock[kind]--; holdItem(w, newItem('food', { food: kind })); return; }
+        say(w, 'Vitrina vacía: trae del congelador'); sfx.wrong(); return;
+      }
+      case 'oven': if (f.item && f.item.place === 'oven') { holdItem(w, f.item); return; } break;
+      case 'counter': if (f.item && f.item.place === 'counter') { holdItem(w, f.item); return; } break;
+      case 'mopstand': if (state.mop.place === 'stand') { holdItem(w, state.mop); return; } break;
+      case 'bin': if (bin.fill > 0) { const b = newItem('bag', { fill: bin.fill }); bin.fill = 0; holdItem(w, b); return; } break;
+    }
+  }
+  if (tg.item) { holdItem(w, tg.item); return; }
+  if (f && f.type === 'shelf') say(w, 'Trae una caja del almacén');
+  else if (f && f.type === 'register') say(w, `Mantén ${workKey(w)} para cobrar`);
+}
+function doWork(w, tg, dt) {
+  w.workKind = null;
+  if (tg.partner) { // up you get
+    tg.partner.down = 0; tg.partner.immune = tune.slip_immune; tg.partner.vx = tg.partner.vz = 0;
+    w.stats.ayudas++; floater('¡Arriba!', tg.partner.x, 2.0, tg.partner.z, 'mag'); sfx.up(); return;
+  }
+  const f = tg.fx;
+  if (f && f.type === 'register' && w.x > 13.6) { // each till charges the customer standing at it
+    const c = f.cust;
+    if (c && c.atSlot) {
+      c.checkoutP += dt / (tune.checkout_time + tune.checkout_per_item * c.got.length);
+      w.workKind = 'cobro'; w.workP = c.checkoutP;
+      if (c.checkoutP >= 1) checkout(w, c, f);
+    }
+    return;
+  }
+  if (f && f.type === 'shelf' && w.held && w.held.kind === 'box') {
+    const sh = f.shelf;
+    if (w.held.prod !== sh.prod) { if (w.warnT <= 0) sfx.wrong(); say(w, '¡Ese no va ahí!'); return; }
+    if (sh.stock >= sh.cap) { say(w, 'Ya está lleno'); return; }
+    sh.fill += dt / tune.restock_time; w.workKind = 'repo'; w.workP = sh.fill;
+    if (sh.fill >= 1) {
+      sh.fill = 0; sh.stock = sh.cap; sh.emptyT = 0; removeItem(w.held);
+      state.tut.restock = true; reward(w, 'repos', sh.cx, sh.cz);
+    }
+    return;
+  }
+  if (f && f.type === 'display' && w.held && w.held.kind === 'foodbox') {
+    const food = w.held.food;
+    if ((display.stock[food] || 0) >= tune.display_cap) { say(w, 'Ya está lleno'); return; }
+    display.fill += dt / tune.restock_time; w.workKind = 'repo'; w.workP = display.fill;
+    if (display.fill >= 1) {
+      display.fill = 0; display.stock[food] = tune.display_cap; removeItem(w.held);
+      state.tut.display = true; reward(w, 'repos', display.x + 0.5, display.z + 0.5);
+    }
+    return;
+  }
+  if (tg.spill && w.held && w.held.kind === 'mop') {
+    const s = tg.spill; s.clean += dt / tune.mop_time; w.workKind = 'mop'; w.workP = s.clean;
+    if (s.clean >= 1) { removeSpill(s); state.tut.mop = true; reward(w, 'limpiezas', s.x, s.z); }
+  }
+}
+function placeSignal(w) { // "over here": a marker and a sound; the bot comes
+  let tx = Math.floor(w.x + w.fx * 1.2), tz = Math.floor(w.z + w.fz * 1.2);
+  if (!staffOK(tx, tz)) { tx = Math.floor(w.x); tz = Math.floor(w.z); }
+  state.signal = { x: tx + 0.5, z: tz + 0.5, t: 4, forBot: !w.isBot && state.workers.some(o => o.isBot) };
+  if (state.tutor) state.tutor.signaled = true;
+  sfx.signal(); events.push({ type: 'signal', who: w.name });
+}
+function checkSlip(w) {
+  if (w.immune > 0 || w.down > 0 || Math.hypot(w.vx, w.vz) < tune.slip_min_speed) return;
+  for (const s of state.spills) if (s.type === 'liquid' && Math.hypot(s.x - w.x, s.z - w.z) < 0.36) { slip(w); return; }
+}
+function slip(w) {
+  w.down = tune.slip_time; w.spin = 0; w.stats.resbalones++;
+  if (w.held) throwItem(w.held, w.x, w.z, w.fx, w.fz, 1.3, w);
+  w.vx = w.fx * 3; w.vz = w.fz * 3;
+  sfx.slip(); floater('¡Uy!', w.x, 2.0, w.z, 'mag'); events.push({ type: 'slip', who: w.name, t: state.t });
+}
+function workerCollisions() {
+  const [a, b] = state.workers;
+  const dx = b.x - a.x, dz = b.z - a.z, d = Math.hypot(dx, dz), minD = 0.6;
+  if (d < minD && d > 1e-4) {
+    const nx = dx / d, nz = dz / d, closing = (a.vx - b.vx) * nx + (a.vz - b.vz) * nz;
+    if (closing > tune.bump_speed && a.down <= 0 && b.down <= 0 && a.stun <= 0 && b.stun <= 0) bump(a, b, nx, nz);
+    const ov = minD - d;
+    if (a.isBot) { a.x -= nx * ov; a.z -= nz * ov; }      // the bot always gives way
+    else if (b.isBot) { b.x += nx * ov; b.z += nz * ov; }
+    else { a.x -= nx * ov / 2; a.z -= nz * ov / 2; b.x += nx * ov / 2; b.z += nz * ov / 2; }
+    collide(a); collide(b);
+  }
+  for (const w of state.workers) for (const c of state.customers) { // customers are soft: you squeeze past
+    if (c.gone) continue;
+    const ex = w.x - c.x, ez = w.z - c.z, e = Math.hypot(ex, ez);
+    if (e < 0.5 && e > 1e-4) { w.x += ex / e * (0.5 - e) * 0.5; w.z += ez / e * (0.5 - e) * 0.5; collide(w); }
+  }
+}
+function bump(a, b, nx, nz) {
+  const bp = tune.bump_push;
+  if (a.isBot || b.isBot) { // the bot never knocks you over: a soft bounce only
+    const h = a.isBot ? b : a, s = a.isBot ? 1 : -1;
+    h.vx = nx * s * bp * 0.5; h.vz = nz * s * bp * 0.5; h.stun = 0.15; sfx.bump(); return;
+  }
+  a.stun = b.stun = tune.bump_stun;
+  a.vx = -nx * bp; a.vz = -nz * bp; b.vx = nx * bp; b.vz = nz * bp;
+  for (const [w, s] of [[a, -1], [b, 1]]) {
+    if (w.held && rng() < tune.bump_drop) throwItem(w.held, w.x, w.z, -nz * s + nx * s * 0.3, nx * s + nz * s * 0.3, 1.2, w);
+  }
+  a.stats.choques++; b.stats.choques++;
+  sfx.bump(); floater('¡Pum!', (a.x + b.x) / 2, 2.2, (a.z + b.z) / 2); events.push({ type: 'bump', t: state.t });
+}
+
+// ---- Money and satisfaction -------------------------------------------------------------------
+function earn(w, amount, stat, x, z) {
+  state.money += amount; w.stats.soles += amount; if (stat) w.stats[stat]++;
+  if (stat === 'ventas' || stat === 'pedidos') state.sat = Math.min(100, state.sat + tune.happy_bonus);
+  floater('+' + soles(amount), x, 1.5, z, 'money');
+}
+function reward(w, stat, x, z) { earn(w, tune.task_reward, stat, x, z); sfx.task(); }
+function checkout(w, c, tl) {
+  const total = c.got.reduce((s, p) => s + price(p), 0);
+  earn(w, total, 'ventas', tl.x + 0.5, tl.z + 0.5); state.served++; state.tut.cobro = true;
+  sfx.cash(); events.push({ type: 'sale', amount: total, t: state.t });
+  customerLeave(c, true);
+}
+function checkPickup() { // ready food on the pickup counter goes to the customer waiting for it
+  const it = pickupFx.item;
+  if (!it || it.place !== 'counter' || it.kind !== 'food' || foodState(it) !== 'ready') return;
+  let best = null;
+  for (const c of state.pickup) if (!c.served && c.arrivedOnce && c.order === it.food && (!best || c.patience < best.patience)) best = c;
+  if (!best) return;
+  const total = price(it.food) + best.got.reduce((s, p) => s + price(p), 0);
+  const w = state.workers.find(o => o.id === it.lastBy) || state.workers[0];
+  removeItem(it); earn(w, total, 'pedidos', pickupFx.x + 0.5, pickupFx.z + 0.5);
+  best.served = true; state.served++; state.tut.hot = true; sfx.cash(); events.push({ type: 'order', amount: total, t: state.t });
+  customerLeave(best, true);
+}
+function updateMess(dt) { // empty shelves and old spills cost satisfaction, a little at a time
+  if (state.tutor) return; // the tutorial never costs anything
+  const mult = (state.phase === 'tut' ? tune.tutorial_drain : 1) * dm('penalty');
+  for (const p of PRODS) {
+    const sh = shelves[p];
+    if (sh.stock <= 0) { sh.emptyT += dt; if (sh.emptyT > tune.empty_grace) state.sat -= tune.empty_drain * mult * dt; }
+    else sh.emptyT = 0;
+  }
+  for (const s of state.spills) { s.age += dt; if (s.age > tune.spill_grace) state.sat -= tune.spill_drain * mult * dt; }
+  state.sat = Math.min(100, state.sat);
+}
+function makeSpill(x, z, type) {
+  if (state.spills.length >= tune.max_spills) return null;
+  const tx = Math.floor(x), tz = Math.floor(z);
+  if (!staffOK(tx, tz) || tz === 12) return null;
+  if (state.spills.some(s => Math.floor(s.x) === tx && Math.floor(s.z) === tz)) return null;
+  const s = { id: state.nextId++, type, x: tx + 0.5 + (rng() - 0.5) * 0.2, z: tz + 0.5 + (rng() - 0.5) * 0.2, age: 0, clean: 0, mesh: null, ring: null };
+  if (world3) { s.mesh = spillMesh(type); s.mesh.position.set(s.x, 0, s.z); s.mesh.rotation.y = rng() * 6.28; s.ring = s.mesh.userData.ring; world3.add(s.mesh); }
+  state.spills.push(s);
+  sfx.splash(); floater(type === 'liquid' ? '¡Plaf!' : '¡Se rebalsó!', s.x, 1.0, s.z); events.push({ type: 'spill', t: state.t });
+  return s;
+}
+function removeSpill(s) {
+  if (s.mesh) world3.remove(s.mesh);
+  state.spills.splice(state.spills.indexOf(s), 1);
+}
+
+// ---- Customers --------------------------------------------------------------------------------
+function pubPath(c, gx, gz) { return bfs(Math.floor(c.x), Math.floor(c.z), (x, z) => x === gx && z === gz, pubOK) || []; }
+function spawnCustomer(kind, list, order, opt = {}) {
+  const K = KIND[kind], d = pick(DOOR);
+  const c = {
+    id: state.nextId++, kind, x: d[0] + 0.5, z: 12.6, face: [0, -1], path: [], st: 'shop', list: list.slice(), got: [], order: order || null,
+    pmax: state.tutor ? 9999 : tune[K.patience] * dm('patience') * (state.phase === 'tut' ? tune.tutorial_patience : 1), patience: 0, arrivedOnce: false, atSlot: false, slot: null,
+    checkoutP: 0, waitT: 0, slipT: 0, slipped: new Set(), spillAt: -1, forceSpill: !!opt.spill, want: null, served: false, happy: true,
+    mood: '', leaveT: 0, gone: false, view: null, h: K.h, shelf: null,
+  };
+  c.patience = c.pmax;
+  if (world3) { c.view = makeCustomer(kind, Math.floor(rng() * 4)); c.view.g.position.set(c.x, 0, c.z); c.view.g.scale.setScalar(tune.figure_scale); c.view.ang = Math.PI; world3.add(c.view.g); }
+  state.customers.push(c); state.spawned++; sfx.chime();
+  nextStage(c);
+  return c;
+}
+function nextStage(c) { // shop the list, then wait for hot food or queue at the till, then leave
+  if (c.list.length) {
+    const sh = shelves[c.list[0]]; c.shelf = sh;
+    const acc = sh.pubAccess.slice().sort((a, b) => Math.hypot(a[0] + 0.5 - c.x, a[1] + 0.5 - c.z) - Math.hypot(b[0] + 0.5 - c.x, b[1] + 0.5 - c.z));
+    const tgt = acc[Math.min(acc.length - 1, Math.floor(rng() * 2))];
+    c.path = pubPath(c, tgt[0], tgt[1]); c.st = 'toShelf'; c.waitT = 0; return;
+  }
+  if (c.order) { c.st = 'pickup'; state.pickup.push(c); reslot(state.pickup, PSLOTS); return; }
+  if (c.got.length) { c.st = 'queue'; state.queue.push(c); reslotQueue(); return; }
+  customerLeave(c, false); // nothing on the shelves for them
+}
+function moveTo(c, s) { if (!c.slot || c.slot[0] !== s[0] || c.slot[1] !== s[1]) { c.slot = s; c.path = pubPath(c, s[0], s[1]); c.atSlot = false; } }
+function reslot(list, slots) { list.forEach((c, i) => moveTo(c, slots[Math.min(i, slots.length - 1)])); }
+function reslotQueue() { // free tills call the next in line; everyone else keeps their place in the line
+  for (const tl of tills) if (!tl.cust) { const c = state.queue.find(q => !q.till); if (c) { tl.cust = c; c.till = tl; } }
+  let i = 0;
+  for (const c of state.queue) moveTo(c, c.till ? c.till.spot : QWAIT[Math.min(i++, QWAIT.length - 1)]);
+}
+function customerLeave(c, happy) {
+  if (c.till) { c.till.cust = null; c.till = null; }
+  let i = state.queue.indexOf(c);
+  if (i >= 0) { state.queue.splice(i, 1); reslotQueue(); }
+  i = state.pickup.indexOf(c);
+  if (i >= 0) { state.pickup.splice(i, 1); reslot(state.pickup, PSLOTS); }
+  c.st = 'leave'; c.happy = happy; c.leaveT = 0; c.want = null;
+  const d = pick(DOOR); c.path = pubPath(c, d[0], d[1]); c.path.push([d[0], 13]);
+  if (!happy) {
+    const pen = state.tutor ? 0 : Math.round(tune.angry_penalty * dm('penalty')); state.angry++; state.sat -= pen; c.mood = 'angry';
+    floater('-' + pen + ' satisfacción', c.x, c.h * tune.figure_scale + 1.0, c.z, 'bad'); sfx.angry(); events.push({ type: 'angry', t: state.t });
+  } else if (rng() < tune.litter_chance) { // a wrapper into the bin on the way out
+    paperFly(c.x, c.z, bin.x + 0.5, bin.z + 0.5); addToBin(1);
+  }
+}
+function maybeSpill(c) {
+  if (c.forceSpill) { c.forceSpill = false; c.spillAt = state.t + 1.2; return; }
+  if (state.phase === 'tut') return;
+  const chance = tune.spill_chance * dm('spill') * KIND[c.kind].spill * (state.phase === 'punta' ? tune.spill_punta_mult : 1);
+  if (rng() < chance) c.spillAt = state.t + 1 + rng() * 4;
+}
+function followPath(c, dt, speed) {
+  if (!c.path.length) return false;
+  const [tx, tz] = c.path[0], gx = tx + 0.5, gz = tz + 0.5, dx = gx - c.x, dz = gz - c.z, d = Math.hypot(dx, dz), step = speed * dt;
+  if (d <= step || (c.path.length > 1 && d < 0.2)) { if (c.path.length === 1) { c.x = gx; c.z = gz; } c.path.shift(); }
+  else { c.x += dx / d * step; c.z += dz / d * step; c.face = [dx / d, dz / d]; }
+  return true;
+}
+function updateCustomer(c, dt) {
+  if (c.slipT > 0) { c.slipT -= dt; return; }
+  const moving = followPath(c, dt, tune[KIND[c.kind].speed]);
+  if (moving) for (const s of state.spills) {
+    if (s.type !== 'liquid' || c.slipped.has(s.id) || Math.hypot(s.x - c.x, s.z - c.z) > 0.33) continue;
+    c.slipped.add(s.id);
+    if (rng() < tune.customer_slip_chance) { c.slipT = 1.1; sfx.slip(); floater('¡Ay!', c.x, c.h * tune.figure_scale + 0.7, c.z); }
+  }
+  if (c.spillAt > 0 && state.t >= c.spillAt) { c.spillAt = -1; makeSpill(c.x, c.z, 'liquid'); }
+  const done = c.path.length === 0;
+  switch (c.st) {
+    case 'toShelf':
+      if (done) {
+        c.st = 'take'; c.waitT = 0;
+        const tx = Math.floor(c.x), tz = Math.floor(c.z);
+        for (const [dx, dz] of DIRS4) { const f = fixAt(tx + dx, tz + dz); if (f && f.type === 'shelf' && f.shelf === c.shelf) c.face = [dx, dz]; }
+      }
+      break;
+    case 'take': {
+      const sh = c.shelf; c.waitT += dt;
+      if (sh.stock > 0) {
+        c.want = null;
+        if (c.waitT >= tune.take_time) { sh.stock--; const p = c.list.shift(); c.got.push(p); if (p === 'bebidas') maybeSpill(c); nextStage(c); }
+      } else {
+        c.want = sh.prod;
+        if (c.waitT > tune.empty_wait + tune.take_time) { c.list.shift(); c.want = null; nextStage(c); }
+      }
+      break;
+    }
+    case 'queue': case 'pickup':
+      if (done) { c.atSlot = true; c.arrivedOnce = true; c.face = [1, 0]; }
+      if (c.arrivedOnce && !c.served) { c.patience -= dt; if (c.patience <= 0) customerLeave(c, false); }
+      break;
+    case 'leave':
+      c.leaveT += dt; if (done) c.gone = true;
+      break;
+  }
+}
+function cleanCustomers() {
+  for (const c of state.customers) if (c.gone && c.view) { world3.remove(c.view.g); c.view = null; }
+  state.customers = state.customers.filter(c => !c.gone);
+}
+
+// ---- The shift: a minute that teaches, a crunch, rush hour, a breather --------------------------
+const PHASE_NAME = { tut: 'Enseñanza', apuro: 'Se llena', punta: 'Hora punta', respiro: 'Respiro' };
+const phaseAt = t => t < tune.tutorial_end ? 'tut' : t < tune.rush_start ? 'apuro' : t < tune.rush_end ? 'punta' : 'respiro';
+// The first minute: one task at a time (a restock, a sale, a hot order, a spill).
+const SCRIPT = [
+  { t: 1.5, kind: 'escolar', list: ['snacks', 'galletas'] },
+  { t: 30, kind: 'oficinista', order: 'hamburguesa' },
+  { t: 44, kind: 'abuelita', list: ['bebidas'], spill: true },
+  { t: 55, kind: 'deportista', list: ['bebidas'] },
+];
+// The first real trouble: a queue and a hot order at once, with a shelf running out.
+const CRUNCH = [
+  { d: 0, kind: 'escolar', list: ['snacks'] },
+  { d: 0.6, kind: 'deportista', list: ['bebidas', 'snacks'] },
+  { d: 1.2, kind: 'oficinista', order: 'hamburguesa' },
+  { d: 1.8, kind: 'abuelita', list: ['abarrotes', 'galletas'] },
+  { d: 2.6, kind: 'obrero', order: 'empanada', list: ['bebidas'] },
+];
+function shopList(pool, n) {
+  const out = [];
+  for (let i = 0; i < 12 && out.length < n; i++) { const p = pick(pool); if (!out.includes(p)) out.push(p); }
+  return out;
+}
+function spawnRandom() {
+  const ph = state.phase;
+  if (rng() < tune['hungry_' + ph]) {
+    const kind = rng() < 0.55 ? 'oficinista' : 'obrero';
+    const r = rng();
+    const order = kind === 'oficinista' ? (r < 0.5 ? 'hamburguesa' : r < 0.75 ? 'empanada' : 'postre') : (r < 0.6 ? 'empanada' : r < 0.9 ? 'hamburguesa' : 'postre');
+    spawnCustomer(kind, rng() < (kind === 'obrero' ? 0.6 : 0.3) ? ['bebidas'] : [], order);
+  } else {
+    const kind = pick(['escolar', 'escolar', 'abuelita', 'deportista', 'deportista']);
+    const pool = { escolar: ['snacks', 'galletas', 'bebidas', 'snacks'], abuelita: ['abarrotes', 'galletas', 'abarrotes', 'bebidas'], deportista: ['bebidas', 'bebidas', 'snacks'] }[kind];
+    // an abuelita now and then also wants a slice of cake: she waits at the case and pays there
+    spawnCustomer(kind, shopList(pool, rng() < 0.45 ? 2 : 1), kind === 'abuelita' && rng() < 0.3 ? 'postre' : null);
+  }
+}
+function banner(t) { state.banner = { text: t, t: 0 }; sfx.banner(); }
+function director(dt) {
+  const t = state.t, ph = phaseAt(t);
+  if (ph !== state.phase) {
+    state.phase = ph;
+    const msg = { apuro: '¡Se llena la tienda!', punta: '¡HORA PUNTA!', respiro: 'Respiro: ordena y cierra' }[ph];
+    if (msg) banner(msg);
+    if (ph !== 'tut') state.nextSpawn = ph === 'apuro' ? tune.crunch_delay + 8 : tune['spawn_' + ph] * dm('spawn') * 0.5;
+    events.push({ type: 'phase', phase: ph, t });
+  }
+  while (state.scriptIdx < SCRIPT.length && t >= SCRIPT[state.scriptIdx].t) {
+    const s = SCRIPT[state.scriptIdx++]; spawnCustomer(s.kind, s.list || [], s.order || null, { spill: s.spill });
+  }
+  const ct = tune.tutorial_end + tune.crunch_delay;
+  while (state.crunchIdx < CRUNCH.length && t >= ct + CRUNCH[state.crunchIdx].d) {
+    const s = CRUNCH[state.crunchIdx++]; spawnCustomer(s.kind, s.list || [], s.order || null);
+  }
+  if (ph !== 'tut') {
+    state.nextSpawn -= dt;
+    if (state.nextSpawn <= 0) {
+      if (state.customers.length < maxCustomers()) spawnRandom();
+      state.nextSpawn = tune['spawn_' + ph] * dm('spawn') * (0.75 + rng() * 0.5);
+    }
+  }
+  if (!state.lastCall && t >= tune.shift_length - 10) { state.lastCall = true; banner('¡Últimos 10 segundos!'); }
+}
+function finishShift() {
+  state.stars = 1 + (state.money >= starGoal(2) ? 1 : 0) + (state.money >= starGoal(3) ? 1 : 0);
+  state.gained = `${state.stars} estrella${state.stars > 1 ? 's' : ''}`; state.resT = 0; scene = 'results';
+  events.push({ type: 'win', stars: state.stars, money: state.money });
+}
+
+// ---- The bot partner: picks the most urgent job the human is not doing, never blocks them ------
+const other = w => state.workers.find(o => o !== w);
+const waitingFor = food => state.pickup.some(c => !c.served && c.order === food);
+const humanHas = (h, pred) => h && !h.isBot && h.held && pred(h.held);
+const spillOn = (x, z) => state.spills.some(s => s.type === 'liquid' && Math.floor(s.x) === x && Math.floor(s.z) === z);
+function wantedFoods() { // food ordered and not yet on its way, most impatient order first
+  const pat = c => c.arrivedOnce ? c.patience : c.pmax;
+  const waiting = state.pickup.filter(c => !c.served).sort((a, c) => pat(a) - pat(c));
+  const have = {};
+  for (const i of state.items) if (i.kind === 'food' && foodState(i) !== 'burned') have[i.food] = (have[i.food] || 0) + 1;
+  const out = [];
+  for (const c of waiting) { if (have[c.order] > 0) have[c.order]--; else out.push(c.order); }
+  return out;
+}
+const neededFood = () => wantedFoods()[0] || null;
+function displayPick() { // what the cold display hands out: the most urgent order it can fill, else anything
+  for (const k of wantedFoods()) if (display.stock[k] > 0) return k;
+  return FOODS.find(k => display.stock[k] > 0) || null;
+}
+function chooseTask(b) {
+  const h = other(b), B = b.bot;
+  if (h && h.down > 0) return { key: 'help', kind: 'help', who: h };
+  if (state.signal && state.signal.forBot) return { key: 'signal', kind: 'signal' };
+  if (b.held) return { key: 'held' + b.held.id, kind: 'held' };
+  if (state.tutor) return { key: 'idle', kind: 'idle' }; // in the tutorial the jobs are yours to learn
+  const near = B.near;
+  const nearPt = (x, z) => near && Math.hypot(near.x - x, near.z - z) < 2.6;
+  if (near) { // nudged by a signal: the job next to it comes first
+    const tn = tills.find(t => t.cust && nearPt(t.x + 0.5, t.z + 0.5));
+    if (tn) return { key: 'checkout' + tn.z, kind: 'checkout', till: tn };
+    for (const p of PRODS) {
+      const sh = shelves[p];
+      if (sh.stock < sh.cap && nearPt(sh.cx, sh.cz) && !humanHas(h, i => i.kind === 'box' && i.prod === p)) return { key: 'restock' + p, kind: 'restock', prod: p };
+    }
+    if (state.spills.some(s => nearPt(s.x, s.z)) && !humanHas(h, i => i.kind === 'mop') && state.mop.place !== 'held') return { key: 'mop', kind: 'mop' };
+  }
+  for (const o of ovens) {
+    const it = o.item; if (!it || it.place !== 'oven') continue;
+    const st = foodState(it);
+    if (h && !h.isBot && !h.held && Math.hypot(h.x - (o.x - 0.5), h.z - (o.z + 0.5)) < 1.3) continue; // the human has it
+    if (st === 'burned' || (st === 'ready' && (waitingFor(it.food) || it.cook > tune.cook_time + burnTime() * 0.45))) return { key: 'oven' + o.z, kind: 'oven', oven: o };
+  }
+  // In the teaching minute the human gets the first go at each new job; the bot backs them up.
+  const slow = state.phase === 'tut' ? tune.bot_tutorial_wait : 0;
+  const waited = c => c.arrivedOnce && c.pmax - c.patience >= slow;
+  const humanAt = t => h && !h.isBot && Math.hypot(h.x - 14.5, h.z - (t.z + 0.5)) < 1.1;
+  const tl = tills.find(t => t.cust && t.cust.atSlot && waited(t.cust) && !humanAt(t)); // the till the human is not on
+  if (tl) return { key: 'checkout' + tl.z, kind: 'checkout', till: tl };
+  const loose = state.items.find(i => i.kind === 'food' && i.place === 'counter' && i.handoff <= 0 && (foodState(i) === 'frozen' || foodState(i) === 'heating') && waitingFor(i.food));
+  if (loose) return { key: 'loose' + loose.id, kind: 'fetch', item: loose };
+  const need = neededFood();
+  if (need && (!slow || state.pickup.some(c => !c.served && c.order === need && waited(c)))) return { key: 'food' + need, kind: 'getfood', food: need };
+  const empty = PRODS.map(p => shelves[p]).filter(s => s.stock === 0 && s.emptyT >= slow && !humanHas(h, i => i.kind === 'box' && i.prod === s.prod)).sort((a, c) => c.emptyT - a.emptyT)[0];
+  if (empty) return { key: 'restock' + empty.prod, kind: 'restock', prod: empty.prod };
+  const out = FOODS.find(k => !display.stock[k] && !humanHas(h, i => i.kind === 'foodbox' && i.food === k) && !state.items.some(i => i.kind === 'foodbox' && i.food === k));
+  if (out && !slow) return { key: 'refill' + out, kind: 'refill', food: out };
+  if (state.spills.some(s => s.age >= slow) && state.mop.place !== 'held') return { key: 'mop', kind: 'mop' };
+  if (bin.fill >= tune.bin_cap && !humanHas(h, i => i.kind === 'bag')) return { key: 'bag', kind: 'bag' };
+  const low = slow ? null : PRODS.map(p => shelves[p]).filter(s => s.stock <= 1 && !humanHas(h, i => i.kind === 'box' && i.prod === s.prod)).sort((a, c) => a.stock - c.stock)[0];
+  if (low) return { key: 'restock' + low.prod, kind: 'restock', prod: low.prod };
+  return { key: 'idle', kind: 'idle' };
+}
+const fixPlan = (f, act, extra) => ({ goals: f.staffAccess, faceFn: g => g === f, act, ...extra });
+function itemPlan(it) {
+  if (it.place === 'floor') return { goals: [[Math.floor(it.x), Math.floor(it.z)]], facePt: [it.x, it.z], act: 'grab', reach: 0.4 };
+  if ((it.place === 'counter' || it.place === 'oven') && it.fix) return fixPlan(it.fix, 'grab');
+  if (it.place === 'stand') return fixPlan(mopStand, 'grab');
+  return null;
+}
+const HANDOFF = [[13, 7], [17, 6], [16, 6], [15, 6], [14, 6], [13, 6]]; // plain counter tops
+function planHeld(b, h) {
+  const it = b.held;
+  if (it.kind === 'box') {
+    const sh = shelves[it.prod];
+    if (sh.stock >= sh.cap) return { drop: true }; // nothing to fill yet: set it down for later
+    return { goals: sh.staffAccess, faceFn: g => g.type === 'shelf' && g.shelf === sh, act: 'work' };
+  }
+  if (it.kind === 'mop') {
+    let best = null, bd = 1e9;
+    for (const s of state.spills) { const d = Math.hypot(s.x - b.x, s.z - b.z); if (d < bd) { bd = d; best = s; } }
+    if (best) {
+      const tx = Math.floor(best.x), tz = Math.floor(best.z);
+      const goals = DIRS4.map(([dx, dz]) => [tx + dx, tz + dz]).filter(([x, z]) => staffOK(x, z) && !spillOn(x, z));
+      return { goals: goals.length ? goals : [[tx, tz]], facePt: [best.x, best.z], act: 'work' };
+    }
+    return fixPlan(mopStand, 'grab');
+  }
+  if (it.kind === 'bag') return fixPlan(dumpster, 'grab');
+  if (it.kind === 'foodbox') {
+    if ((display.stock[it.food] || 0) >= tune.display_cap) return { drop: true };
+    return { goals: display.staffAccess, faceFn: g => g === display, act: 'work' };
+  }
+  const st = foodState(it);
+  if (st === 'burned') return fixPlan(bin, 'grab');
+  if (st === 'ready') {
+    if (!pickupFx.item) return fixPlan(pickupFx, 'grab');
+    const free = counters.filter(c => !c.item && !c.pickup).sort((a, c) => Math.hypot(a.x - b.x, a.z - b.z) - Math.hypot(c.x - b.x, c.z - b.z))[0];
+    return free ? fixPlan(free, 'grab') : { drop: true };
+  }
+  if (!it.noHandoff && !inZonePos(b) && h && !h.isBot && inZonePos(h) && !h.held && h.down <= 0) { // hand it over the counter
+    for (const [x, z] of HANDOFF) {
+      const f = fixAt(x, z);
+      if (f && !f.item && f.floorAccess.length) return { goals: f.floorAccess, faceFn: g => g === f, act: 'grab', handoff: true };
+    }
+  }
+  const freeOven = ovens.find(o => !o.item);
+  if (freeOven) return fixPlan(freeOven, 'grab');
+  return { goals: [[16, 9]], reach: 0.5 };
+}
+function planTask(b, T) {
+  const h = other(b);
+  switch (T.kind) {
+    case 'help': { const p = T.who; if (p.down <= 0) return null; return { goals: [[Math.floor(p.x), Math.floor(p.z)]], reach: 1.05, facePt: [p.x, p.z], act: 'work' }; }
+    case 'signal': {
+      const s = state.signal; if (!s) return null;
+      return { goals: [[Math.floor(s.x), Math.floor(s.z)]], reach: 0.7, arrive: () => { s.forBot = false; b.bot.near = { x: s.x, z: s.z, t: 6 }; b.bot.think = 0; } };
+    }
+    case 'held': return planHeld(b, h);
+    case 'oven': return fixPlan(T.oven, 'grab');
+    case 'checkout': return T.till.cust ? { goals: [[14, T.till.z]], faceFn: g => g === T.till, act: 'work' } : null;
+    case 'fetch': return itemPlan(T.item);
+    case 'getfood': return display.stock[T.food] > 0 ? fixPlan(display, 'grab') : fixPlan(freezers[T.food], 'grab');
+    case 'refill': {
+      const loose = state.items.find(i => i.kind === 'foodbox' && i.food === T.food && (i.place === 'floor' || i.place === 'counter'));
+      return display.stock[T.food] ? null : loose ? itemPlan(loose) : fixPlan(freezers[T.food], 'grab');
+    }
+    case 'restock': {
+      const loose = state.items.find(i => i.kind === 'box' && i.prod === T.prod && (i.place === 'floor' || i.place === 'counter'));
+      return loose ? itemPlan(loose) : fixPlan(crates[T.prod], 'grab');
+    }
+    case 'mop': return state.mop.place === 'held' ? null : itemPlan(state.mop);
+    case 'bag': return fixPlan(bin, 'grab');
+    default: return { goals: [h && inZonePos(h) ? [7, 8] : [15, 8]], reach: 0.5 };
+  }
+}
+function botPath(b, goals) {
+  const isGoal = (x, z) => goals.some(g => g[0] === x && g[1] === z);
+  const sx = Math.floor(b.x), sz = Math.floor(b.z);
+  return bfs(sx, sz, isGoal, staffOK, spillOn) || bfs(sx, sz, isGoal, staffOK, null);
+}
+function faceTileFor(b, fn) {
+  if (!fn) return null;
+  const tx = Math.floor(b.x), tz = Math.floor(b.z);
+  for (const [dx, dz] of DIRS4) { const f = fixAt(tx + dx, tz + dz); if (f && fn(f)) return [tx + dx + 0.5, tz + dz + 0.5]; }
+  return null;
+}
+function botInput(b, dt) {
+  const B = b.bot, inp = { mx: 0, mz: 0, grab: false, work: false, signal: false, face: null };
+  B.think -= dt; B.act -= dt; B.repath -= dt;
+  if (B.near && (B.near.t -= dt) <= 0) B.near = null;
+  if (B.think <= 0 || !B.task) {
+    B.think = tune.bot_think;
+    const T = chooseTask(b);
+    if (!B.task || T.key !== B.task.key) { B.path = null; B.said = false; if (T.kind === 'signal') floater('¡Voy!', b.x, 2.1, b.z, 'mag'); }
+    B.task = T;
+  }
+  const plan = planTask(b, B.task);
+  if (!plan || (!plan.drop && !(plan.goals && plan.goals.length))) { B.think = 0; return inp; }
+  if (plan.drop) { dropOnFloor(b.held, b.x + b.fx * 0.4, b.z + b.fz * 0.4, b); B.think = 0; return inp; }
+  const reach = plan.reach || 0.22;
+  const there = plan.goals.some(([x, z]) => Math.hypot(x + 0.5 - b.x, z + 0.5 - b.z) < reach);
+  if (!there) {
+    const key = plan.goals.map(g => g.join(',')).join(';');
+    if (!B.path || B.goalKey !== key || B.repath <= 0) { B.path = botPath(b, plan.goals) || []; B.goalKey = key; B.repath = 1.0; }
+    while (B.path.length && Math.hypot(B.path[0][0] + 0.5 - b.x, B.path[0][1] + 0.5 - b.z) < (B.path.length > 1 ? 0.3 : 0.08)) B.path.shift();
+    let gx, gz;
+    if (B.path.length) { gx = B.path[0][0] + 0.5; gz = B.path[0][1] + 0.5; }
+    else {
+      let best = plan.goals[0], bd = 1e9;
+      for (const g of plan.goals) { const d = Math.hypot(g[0] + 0.5 - b.x, g[1] + 0.5 - b.z); if (d < bd) { bd = d; best = g; } }
+      gx = best[0] + 0.5; gz = best[1] + 0.5;
+    }
+    inp.mx = gx - b.x; inp.mz = gz - b.z;
+    if (Math.hypot(b.x - B.lastX, b.z - B.lastZ) > 0.25) { B.lastX = b.x; B.lastZ = b.z; B.stuckT = 0; }
+    else if ((B.stuckT += dt) > 1.2) { B.stuckT = 0; B.path = null; B.jitter = 0.35; B.jx = rng() - 0.5; B.jz = rng() - 0.5; }
+    if (B.jitter > 0) { B.jitter -= dt; inp.mx += B.jx * 2; inp.mz += B.jz * 2; }
+    return inp;
+  }
+  B.stuckT = 0; B.lastX = b.x; B.lastZ = b.z;
+  if (plan.arrive) plan.arrive();
+  const fp = plan.facePt || faceTileFor(b, plan.faceFn);
+  if (fp) { const dx = fp[0] - b.x, dz = fp[1] - b.z, d = Math.hypot(dx, dz); if (d > 0.05) inp.face = [dx / d, dz / d]; }
+  if (plan.act === 'grab' && B.act <= 0) {
+    inp.grab = true; B.act = 0.35; B.think = Math.min(B.think, 0.1);
+    if (plan.handoff && !B.said) { B.said = true; floater('¡Te lo paso!', b.x, 2.1, b.z, 'mag'); }
+  }
+  if (plan.act === 'work') inp.work = true;
+  return inp;
+}
+
+// ---- Effects ------------------------------------------------------------------------------------
+const FLOAT_STYLE = { money: [COL.yel, COL.ink], bad: [COL.red, '#FFFFFF'], info: ['#FFFFFF', COL.ink], mag: [COL.mag, '#FFFFFF'] };
+function floater(s, x, y, z, style = 'info') {
+  state.floaters.push({ text: s, x, y, z, t: 0, style });
+  if (state.floaters.length > 14) state.floaters.shift();
+}
+function puff(x, y, z) {
+  if (!world3) return;
+  const m = new T3.Mesh(SPH(0.09, 6, 5), new T3.MeshBasicMaterial({ color: '#6B6670', transparent: true, opacity: 0.7, depthWrite: false }));
+  m.position.set(x + (rng() - 0.5) * 0.2, y, z + (rng() - 0.5) * 0.2); world3.add(m);
+  parts.push({ m, vx: (rng() - 0.5) * 0.2, vy: 0.7, vz: (rng() - 0.5) * 0.2, life: 0, max: 1.2, grow: 1.6, own: true });
+}
+function paperFly(x0, z0, x1, z1) {
+  if (!world3) return;
+  const m = part(BOX(0.1, 0.02, 0.08), '#FFFFFF', x0, 1, z0, 0.012); world3.add(m);
+  parts.push({ m, arc: [x0, 1.0, z0, x1, 0.8, z1], life: 0, max: 0.6 });
+}
+function updateFX(dt) {
+  for (const f of state.floaters) f.t += dt;
+  state.floaters = state.floaters.filter(f => f.t < 1.5);
+  if (state.banner) state.banner.t += dt;
+  if (state.signal && (state.signal.t -= dt) <= 0) state.signal = null;
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i]; p.life += dt;
+    if (p.arc) {
+      const k = Math.min(1, p.life / p.max), a = p.arc;
+      p.m.position.set(a[0] + (a[3] - a[0]) * k, a[1] + (a[4] - a[1]) * k + Math.sin(Math.PI * k) * 0.8, a[2] + (a[5] - a[2]) * k);
+      p.m.rotation.y += dt * 9;
+    } else {
+      p.m.position.x += p.vx * dt; p.m.position.y += p.vy * dt; p.m.position.z += p.vz * dt;
+      p.m.scale.setScalar(1 + p.life * p.grow); p.m.material.opacity = 0.7 * (1 - p.life / p.max);
+    }
+    if (p.life >= p.max) { if (world3) world3.remove(p.m); parts.splice(i, 1); }
+  }
+}
+
+// ---- Drawing the world: figures follow the state ----------------------------------------------
+function animChar(v, dt, speed, pose) {
+  v.phase += dt * (2 + speed * 2.6);
+  const amp = Math.min(1, speed / 3), sw = Math.sin(v.phase) * amp * 0.75;
+  v.legs.forEach((l, i) => { l.rotation.x = i ? -sw : sw; });
+  if (pose === 'carry') { v.arms[0].rotation.x = -1.25; v.arms[1].rotation.x = -1.25; }
+  else if (pose === 'work') { const k = Math.sin(animT * 22) * 0.35; v.arms[0].rotation.x = -1.05 + k; v.arms[1].rotation.x = -1.05 - k; }
+  else { v.arms[0].rotation.x = -sw * 0.9; v.arms[1].rotation.x = sw * 0.9; }
+  v.bob = Math.abs(Math.sin(v.phase)) * 0.04 * amp;
+  v.head.rotation.z = Math.sin(v.phase * 0.5) * 0.07 * amp;
+}
+function syncWorker(w, dt) {
+  const v = w.view; if (!v) return;
+  v.g.position.set(w.x, 0, w.z);
+  v.ang = lerpAng(v.ang, Math.atan2(w.fx, w.fz), Math.min(1, dt * 16));
+  const pose = w.down > 0 ? null : w.held ? 'carry' : w.workKind ? 'work' : null;
+  animChar(v, dt, w.down > 0 ? 0 : Math.hypot(w.vx, w.vz), pose);
+  if (w.down > 0) {
+    const fall = Math.min(1, (tune.slip_time - w.down) * 7) * Math.min(1, w.down * 4);
+    v.g.rotation.y = v.ang + w.spin; v.body.rotation.x = -1.35 * fall; v.body.position.y = 0.1 * fall;
+  } else { v.g.rotation.y = v.ang; v.body.rotation.x = 0; v.body.position.y = v.bob; }
+  const s = w.stun > 0 ? 1 + 0.18 * Math.sin(w.stun * 40) : 1;
+  v.body.scale.set(s, 2 - s, s);
+}
+function syncCustomer(c, dt) {
+  const v = c.view;
+  v.g.position.set(c.x, 0, c.z);
+  v.ang = lerpAng(v.ang, Math.atan2(c.face[0], c.face[1]), Math.min(1, dt * 10));
+  const moving = c.path.length > 0 && c.slipT <= 0;
+  animChar(v, dt, moving ? tune[KIND[c.kind].speed] : 0, null);
+  if (c.slipT > 0) {
+    const k = 1.1 - c.slipT;
+    v.g.rotation.y = v.ang + k * 9; v.body.rotation.x = -1.3 * Math.min(1, k * 6) * Math.min(1, c.slipT * 3);
+  } else { v.g.rotation.y = v.ang; v.body.rotation.x = 0; }
+  v.body.position.y = v.bob;
+  if (c.mood === 'angry' && c.leaveT < 2.5) v.head.rotation.z = Math.sin(animT * 28) * 0.2;
+}
+function syncItem(it) {
+  const m = it.mesh; if (!m) return;
+  let x = it.x, y = 0.01, z = it.z, ry = it.rot, rz = 0;
+  switch (it.place) {
+    case 'held': {
+      const w = it.holder, k = tune.figure_scale, f = (it.kind === 'mop' ? 0.28 : 0.38) * k;
+      x = w.x + w.fx * f; z = w.z + w.fz * f; ry = Math.atan2(w.fx, w.fz);
+      y = (it.kind === 'mop' ? 0.05 : it.kind === 'bag' ? 0.3 : 0.48) * k; rz = it.kind === 'mop' ? 0.35 : 0;
+      break;
+    }
+    case 'counter': x = it.fix.x + 0.5; z = it.fix.z + 0.5; y = it.fix.pickup ? 0.93 : 0.87; break;
+    case 'oven': x = it.fix.x + 0.5; z = it.fix.z + 0.5; y = 0.53; ry = Math.PI / 2; break;
+    case 'stand': x = mopStand.x + 0.65; z = mopStand.z + 0.45; y = 0.02; ry = 0; rz = -0.25; break;
+    case 'fly': {
+      const f = it.fly, k = Math.min(1, f.t / f.dur);
+      x = f.sx + (f.ex - f.sx) * k; z = f.sz + (f.ez - f.sz) * k; y = f.sy + (f.ey - f.sy) * k + Math.sin(Math.PI * k) * 0.7; ry = k * 6; rz = k * 3;
+      break;
+    }
+  }
+  m.position.set(x, y, z); m.rotation.set(0, ry, rz);
+  if (it.kind === 'food') paintFood(m, it.food, it.cook);
+}
+function syncHighlights() {
+  state.workers.forEach((w, i) => {
+    const h = HL[i]; if (!h) return;
+    h.floor.visible = h.top.visible = false;
+    if (w.isBot || !w.target || w.down > 0) return;
+    const tg = w.target;
+    if (tg.fx) {
+      const f = tg.fx, sh = f.type === 'shelf' ? f.shelf : null;
+      const cx = sh ? sh.cx : f.x + 0.5, cz = sh ? sh.cz : f.z + 0.5, sw = sh ? sh.w : 1, sd = sh ? sh.d : 1;
+      h.floor.visible = h.top.visible = true;
+      h.floor.position.set(cx, 0.03, cz); h.floor.scale.set(sw, 1, sd);
+      h.top.position.set(cx, f.h + 0.03, cz); h.top.scale.set(sw, 1, sd);
+    } else if (tg.item) {
+      h.floor.visible = true; h.floor.position.set(tg.item.x, 0.03, tg.item.z); h.floor.scale.set(0.55, 1, 0.55);
+    } else if (tg.spill && w.held && w.held.kind === 'mop') {
+      h.floor.visible = true; h.floor.position.set(tg.spill.x, 0.03, tg.spill.z); h.floor.scale.set(0.9, 1, 0.9);
+    }
+  });
+}
+function syncWorld(dt) {
+  for (const w of state.workers) syncWorker(w, dt);
+  for (const c of state.customers) if (c.view) syncCustomer(c, dt);
+  for (const it of state.items) syncItem(it);
+  for (const p of PRODS) {
+    const sh = shelves[p];
+    sh.slots.forEach((m, i) => { m.visible = i < sh.stock; });
+    if (p === 'bebidas') for (const k of FOODS) display.slots[k].forEach((m, i) => { m.visible = i < (display.stock[k] || 0); });
+    if (sh.alert) sh.alert.visible = sh.stock <= 0 && Math.sin(animT * 8) > -0.3;
+  }
+  for (const o of ovens) {
+    const it = o.item; let c = '#4A2412';
+    if (it && it.place === 'oven') {
+      const st = foodState(it);
+      c = st === 'burned' ? '#5A1E10' : st === 'ready' ? '#FFB347' : '#FF8A2A';
+      if (st === 'ready' && it.cook > tune.cook_time + burnTime() * 0.6 && Math.sin(animT * 20) > 0) c = '#FF3B2F';
+    }
+    o.glow.color.set(c);
+  }
+  bin.lid.rotation.x = -Math.min(1, bin.fill / tune.bin_cap) * 0.9;
+  bin.papers.visible = bin.fill >= tune.bin_cap * 0.75;
+  for (const s of state.spills) if (s.ring) { s.ring.visible = s.age > tune.spill_grace * 0.5; s.ring.scale.setScalar(1 + 0.1 * Math.sin(animT * 7)); }
+  const near = state.customers.some(c => Math.hypot(c.x - 3, c.z - 12.5) < 1.8);
+  store.doorOpen += ((near ? 1 : 0) - store.doorOpen) * Math.min(1, dt * 8);
+  for (const d of store.door) d.g.position.x = d.x0 + d.s * store.doorOpen * 0.9;
+  const gateNear = state.workers.some(w => Math.hypot(w.x - 18.5, w.z - 6.5) < 1.0);
+  store.gateOpen += ((gateNear ? 1 : 0) - store.gateOpen) * Math.min(1, dt * 10);
+  store.gate.rotation.y = store.gateOpen * 1.4;
+  store.neon.color.setScalar((Math.sin(animT * 13.1) + Math.sin(animT * 3.7 + 1)) > 1.8 ? 0.45 : 1); // a flickering tube
+  store.star.color.setScalar(Math.sin(animT * 2.2) > -0.85 ? 1 : 0.5);
+  syncHighlights();
+}
+let lastDraw = 0;
+function render3D() {
+  if (!renderer) return;
+  const now = clock.now(), dt = clamp(now - lastDraw, 0, 0.05); lastDraw = now;
+  syncWorld(scene === 'play' || scene === 'title' ? dt : 0);
+  renderer.render(world3, camera);
+}
+
+// ---- HUD ----------------------------------------------------------------------------------------
+function scr(x, y, z) {
+  if (!camera) return [W / 2, H / 2];
+  V3.set(x, y, z).project(camera);
+  return [(V3.x + 1) / 2 * W, (1 - V3.y) / 2 * H];
+}
+const patCol = f => f > 0.5 ? COL.green : f > 0.25 ? COL.amber : COL.red;
+function drawProdIcon(prod, x, y, s) {
+  ctx.save(); ctx.lineWidth = 2; ctx.strokeStyle = COL.ink; ctx.lineJoin = 'round';
+  const c = PROD[prod].color;
+  if (prod === 'snacks') {
+    ctx.beginPath(); ctx.moveTo(x - s * 0.3, y - s * 0.42); ctx.lineTo(x + s * 0.3, y - s * 0.42); ctx.lineTo(x + s * 0.36, y + s * 0.42); ctx.lineTo(x - s * 0.36, y + s * 0.42); ctx.closePath();
+    ctx.fillStyle = c; ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#FFFFFF'; ctx.fillRect(x - s * 0.31, y - s * 0.06, s * 0.62, s * 0.16);
+  } else if (prod === 'galletas') {
+    rrect(x - s * 0.44, y - s * 0.2, s * 0.88, s * 0.4, s * 0.18); ctx.fillStyle = c; ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#2D5FD0'; ctx.fillRect(x - s * 0.1, y - s * 0.19, s * 0.2, s * 0.38);
+  } else if (prod === 'abarrotes') {
+    rrect(x - s * 0.26, y - s * 0.36, s * 0.52, s * 0.72, s * 0.08); ctx.fillStyle = c; ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#FFFFFF'; ctx.fillRect(x - s * 0.25, y - s * 0.08, s * 0.5, s * 0.2);
+  } else {
+    rrect(x - s * 0.17, y - s * 0.16, s * 0.34, s * 0.56, s * 0.08); ctx.fillStyle = c; ctx.fill(); ctx.stroke();
+    rrect(x - s * 0.07, y - s * 0.38, s * 0.14, s * 0.24, 2); ctx.fill(); ctx.stroke();
+    rrect(x - s * 0.09, y - s * 0.48, s * 0.18, s * 0.11, 2); ctx.fillStyle = '#D33A3A'; ctx.fill(); ctx.stroke();
+  }
+  ctx.restore();
+}
+function drawFoodIcon(kind, x, y, s) {
+  ctx.save(); ctx.lineWidth = 2; ctx.strokeStyle = COL.ink; ctx.lineJoin = 'round';
+  if (kind === 'empanada') {
+    ctx.beginPath(); ctx.arc(x, y + s * 0.18, s * 0.44, Math.PI, 0); ctx.closePath(); ctx.fillStyle = '#D99A3E'; ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#9C6420';
+    for (let i = 0; i < 5; i++) { const a = Math.PI + (i + 0.5) / 5 * Math.PI; ctx.beginPath(); ctx.arc(x + Math.cos(a) * s * 0.34, y + s * 0.18 + Math.sin(a) * s * 0.34, s * 0.05, 0, 7); ctx.fill(); }
+  } else if (kind === 'postre') { // a wedge of layered cake, pink icing, a strawberry
+    const lx = x - s * 0.42, rx = x + s * 0.42, ty = y - s * 0.12, by = y + s * 0.34;
+    ctx.beginPath(); ctx.moveTo(lx, ty); ctx.lineTo(rx, ty - s * 0.12); ctx.lineTo(rx, by - s * 0.12); ctx.lineTo(lx, by); ctx.closePath();
+    ctx.fillStyle = '#F3D9A4'; ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#FFF6EA'; ctx.fillRect(lx + 2, y + s * 0.06, rx - lx - 4, s * 0.08);
+    ctx.beginPath(); ctx.moveTo(lx, ty); ctx.lineTo(rx, ty - s * 0.12); ctx.lineTo(rx, ty - s * 0.02); ctx.lineTo(lx, ty + s * 0.1); ctx.closePath();
+    ctx.fillStyle = '#F49AC1'; ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.arc(x, ty - s * 0.2, s * 0.11, 0, 7); ctx.fillStyle = '#D93A3A'; ctx.fill(); ctx.stroke();
+  } else { // hamburguesa: bottom bun, patty, lettuce, domed top
+    rrect(x - s * 0.42, y + s * 0.2, s * 0.84, s * 0.16, s * 0.07); ctx.fillStyle = '#E0A458'; ctx.fill(); ctx.stroke();
+    rrect(x - s * 0.46, y + s * 0.06, s * 0.92, s * 0.15, s * 0.07); ctx.fillStyle = '#5C3317'; ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x - s * 0.48, y + s * 0.04);
+    for (let i = 1; i <= 8; i++) ctx.lineTo(x - s * 0.48 + i * s * 0.12, y + (i % 2 ? s * 0.0 : s * 0.07));
+    ctx.lineTo(x + s * 0.48, y + s * 0.09); ctx.lineTo(x - s * 0.48, y + s * 0.09); ctx.closePath();
+    ctx.fillStyle = '#4FAE3F'; ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x - s * 0.44, y + s * 0.02); ctx.quadraticCurveTo(x - s * 0.44, y - s * 0.4, x, y - s * 0.4);
+    ctx.quadraticCurveTo(x + s * 0.44, y - s * 0.4, x + s * 0.44, y + s * 0.02); ctx.closePath();
+    ctx.fillStyle = '#E0A458'; ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#FFF7E6';
+    for (const [dx, dy] of [[-0.2, -0.18], [0.02, -0.28], [0.2, -0.16], [-0.05, -0.1]]) ctx.fillRect(x + dx * s - 1.5, y + dy * s - 1, 3, 2);
+  }
+  ctx.restore();
+}
+function drawStar(x, y, r, fill) {
+  ctx.beginPath();
+  for (let i = 0; i < 10; i++) { const a = -Math.PI / 2 + i * Math.PI / 5, rr = i % 2 ? r * 0.46 : r; ctx.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr); }
+  ctx.closePath(); ctx.fillStyle = fill; ctx.fill();
+  ctx.lineWidth = Math.max(2, r * 0.12); ctx.strokeStyle = COL.ink; ctx.lineJoin = 'round'; ctx.stroke();
+}
+function drawWarn(x, y, s) {
+  ctx.beginPath(); ctx.moveTo(x, y - s); ctx.lineTo(x + s, y + s * 0.75); ctx.lineTo(x - s, y + s * 0.75); ctx.closePath();
+  ctx.fillStyle = COL.yel; ctx.fill(); ctx.lineWidth = 2.5; ctx.strokeStyle = COL.ink; ctx.lineJoin = 'round'; ctx.stroke();
+  text('!', x, y + s * 0.22, Math.max(14, Math.round(s * 1.1)), COL.ink);
+}
+function drawAngry(x, y, s) { // a scribble in a bubble
+  ctx.beginPath(); ctx.arc(x, y, s, 0, 7); ctx.fillStyle = '#FFFFFF'; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = COL.ink; ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x - s * 0.6, y);
+  for (let i = 1; i <= 6; i++) ctx.lineTo(x - s * 0.6 + i * s * 0.2, y + (i % 2 ? -s * 0.4 : s * 0.25));
+  ctx.strokeStyle = COL.red; ctx.lineWidth = 3; ctx.stroke();
+}
+function drawHeart(x, y, s) {
+  ctx.beginPath(); ctx.moveTo(x, y + s * 0.7);
+  ctx.bezierCurveTo(x - s * 1.2, y - s * 0.1, x - s * 0.5, y - s * 0.9, x, y - s * 0.3);
+  ctx.bezierCurveTo(x + s * 0.5, y - s * 0.9, x + s * 1.2, y - s * 0.1, x, y + s * 0.7);
+  ctx.fillStyle = COL.mag; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = COL.ink; ctx.stroke();
+}
+function drawAlerts() { // yellow triangles over what needs doing
+  if (Math.sin(animT * 7) < -0.2) return;
+  for (const p of PRODS) {
+    const sh = shelves[p]; if (sh.stock > 0) continue;
+    const [x, y] = scr(sh.cx, sh.fridge ? 2.05 : 1.35, sh.cz); drawWarn(x, y, 14);
+  }
+  if (bin.fill >= tune.bin_cap) { const [x, y] = scr(bin.x + 0.5, 1.2, bin.z + 0.5); drawWarn(x, y, 14); }
+  for (const s of state.spills) if (s.age > tune.spill_grace * 0.5) { const [x, y] = scr(s.x, 0.75, s.z); drawWarn(x, y, 12); }
+  const out = FOODS.filter(k => !display.stock[k]); // a food the cold display ran out of: its icon, crossed
+  if (out.length) {
+    const [x, y] = scr(display.x + 0.5, 1.7, display.z + 0.5); drawWarn(x, y, 14);
+    out.forEach((k, i) => {
+      const cx = x + (i - (out.length - 1) / 2) * 34, cy = y - 34;
+      ctx.beginPath(); ctx.arc(cx, cy, 15, 0, 7); ctx.fillStyle = '#FFFFFF'; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = COL.ink; ctx.stroke();
+      drawFoodIcon(k, cx, cy, 20);
+      ctx.beginPath(); ctx.moveTo(cx - 11, cy + 11); ctx.lineTo(cx + 11, cy - 11); ctx.strokeStyle = COL.red; ctx.lineWidth = 3; ctx.stroke();
+    });
+  }
+}
+function drawCustomersHUD() {
+  for (const c of state.customers) {
+    const [x, y] = scr(c.x, c.h * tune.figure_scale + 0.3, c.z);
+    if (c.want) {
+      ctx.beginPath(); ctx.arc(x, y - 12, 15, 0, 7); ctx.fillStyle = '#FFFFFF'; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = COL.ink; ctx.stroke();
+      drawProdIcon(c.want, x, y - 12, 20);
+      ctx.beginPath(); ctx.moveTo(x - 11, y - 1); ctx.lineTo(x + 11, y - 23); ctx.strokeStyle = COL.red; ctx.lineWidth = 3; ctx.stroke();
+    }
+    if ((c.st === 'queue' || c.st === 'pickup') && c.arrivedOnce && !c.served) { const f = c.patience / c.pmax; meter(x - 22, y - 4, 44, 9, f, patCol(f)); }
+    if (c.st === 'pickup' && !c.served) {
+      ctx.beginPath(); ctx.arc(x, y - 24, 16, 0, 7); ctx.fillStyle = COL.yel; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = COL.ink; ctx.stroke();
+      drawFoodIcon(c.order, x, y - 24, 22);
+    }
+    if (c.st === 'leave' && c.leaveT < 2.2) { if (c.happy) drawHeart(x, y - 10, 9); else drawAngry(x, y - 10, 13); }
+  }
+}
+function drawOvensHUD() {
+  ovens.forEach((o, i) => {
+    const it = o.item; if (!it || it.place !== 'oven') return;
+    const [x, y0] = scr(o.x + 0.5, 1.4, o.z + 0.5), st = foodState(it), y = y0 - (i % 2) * 34; // side by side: stagger
+    if (st === 'frozen' || st === 'heating') meter(x - 26, y - 6, 52, 12, it.cook / tune.cook_time, COL.green);
+    else if (st === 'ready') {
+      const f = (it.cook - tune.cook_time) / burnTime();
+      pill('¡Listo!', x, y - 12, 14, COL.yel, COL.ink);
+      meter(x - 26, y + 8, 52, 10, 1 - f, f > 0.6 && Math.sin(animT * 18) > 0 ? COL.red : COL.amber);
+    } else pill('Quemado', x, y - 6, 14, COL.red, '#FFFFFF');
+  });
+}
+function drawWorkersHUD() {
+  for (const w of state.workers) {
+    const [x, y] = scr(w.x, 1.15 * tune.figure_scale + 0.25, w.z);
+    const bg = w.id === 'p1' ? COL.mag : w.id === 'p2' ? '#FFFFFF' : '#3B3742', fg = w.id === 'p2' ? COL.ink : '#FFFFFF';
+    pill(w.name, x, y, 14, bg, fg);
+    if (w.workKind) meter(x - 26, y - 34, 52, 11, w.workP, COL.green);
+    if (w.down > 0) {
+      for (let i = 0; i < 3; i++) { const a = animT * 6 + i * 2.1; drawStar(x + Math.cos(a) * 22, y + 24 + Math.sin(a) * 6, 6, COL.yel); }
+      if (state.workers.some(o => o !== w && !o.isBot)) pill(`¡Levántame! (${w.id === 'p1' ? 'L' : 'F'})`, x, y - 30, 14, '#FFFFFF', COL.ink);
+    }
+  }
+}
+function hotHint(kind) {
+  const name = FOOD_NAME[kind], fz = freezers[kind], wk = mode2P ? 'F / L' : 'F';
+  const it = state.items.find(i => i.kind === 'food' && i.food === kind && foodState(i) !== 'burned');
+  if (!it) {
+    if (display.stock[kind] > 0) return { x: display.x + 0.5, y: 1.5, z: display.z + 0.5, label: `${name}: vitrina fría` };
+    if (state.items.some(i => i.kind === 'foodbox' && i.food === kind && i.place === 'held')) return { x: display.x + 0.5, y: 1.5, z: display.z + 0.5, label: `Mantén ${wk}: reponer` };
+    return { x: fz.x + 0.5, y: 1.1, z: fz.z + 0.5, label: `${name}: congelador` };
+  }
+  const st = foodState(it), oven = ovens.find(o => !o.item) || ovens[0];
+  if (st === 'ready') {
+    if (it.place === 'oven') return { x: it.fix.x + 0.5, y: 1.35, z: it.fix.z + 0.5, label: '¡Sácalo!' };
+    return { x: pickupFx.x + 0.5, y: 1.55, z: pickupFx.z + 0.5, label: '¡Entrégalo aquí!' };
+  }
+  if (it.place === 'oven') return { x: it.fix.x + 0.5, y: 1.35, z: it.fix.z + 0.5, label: 'Calentando…' };
+  if (it.place === 'held' && !inZonePos(it.holder)) return { x: 13.5, y: 1.1, z: 7.5, label: 'Pásalo al mostrador' };
+  return { x: oven.x + 0.5, y: 1.35, z: oven.z + 0.5, label: 'Al horno' };
+}
+function tutorialHints() { // the first minute's two-word nudges; gone once each task is done once
+  const out = [], T = state.tut, wk = mode2P ? 'F / L' : 'F';
+  if (state.t > 100 || state.tutor) return out;
+  const anyHeld = pred => state.workers.some(w => w.held && pred(w.held));
+  const sn = shelves.snacks;
+  if (!T.restock && sn.stock === 0) {
+    if (anyHeld(h => h.kind === 'box' && h.prod === 'snacks')) out.push({ x: sn.cx, y: 1.2, z: sn.cz, label: `Mantén ${wk}: reponer` });
+    else out.push({ x: crates.snacks.x + 0.5, y: 1.1, z: crates.snacks.z + 0.5, label: 'Repón los snacks' });
+  }
+  const tc = tills.find(t => t.cust && t.cust.atSlot);
+  if (!T.cobro && tc) out.push({ x: tc.x + 0.5, y: 1.3, z: tc.z + 0.5, label: `Cobra: mantén ${wk}` });
+  if (!T.hot) { const c = state.pickup.find(o => !o.served); if (c) out.push(hotHint(c.order)); }
+  if (!T.mop && state.spills.length) {
+    const m = state.mop, s = state.spills[0];
+    if (m.place === 'held') out.push({ x: s.x, y: 0.6, z: s.z, label: `Limpia: mantén ${wk}` });
+    else { const [mx, mz] = itemXZ(m); out.push({ x: mx, y: 1.0, z: mz, label: 'Trae el trapeador' }); }
+  }
+  return out;
+}
+function drawHints() {
+  const tw = state.tutor && !state.tutor.card && TUT_STEPS[state.tutor.i].where;
+  const list = state.tutor ? (tw ? [tw()].filter(Boolean) : []) : tutorialHints();
+  for (const h of list) {
+    const [x, y] = scr(h.x, h.y, h.z), b = Math.sin(animT * 6) * 5;
+    const below = y < 170; // near the top bar: point up from underneath instead
+    const ay = below ? y + 8 - b : y + b, dir = below ? 1 : -1;
+    ctx.beginPath(); ctx.moveTo(x, ay); ctx.lineTo(x - 11, ay + dir * 16); ctx.lineTo(x + 11, ay + dir * 16); ctx.closePath();
+    ctx.fillStyle = COL.yel; ctx.fill(); ctx.lineWidth = 2.5; ctx.strokeStyle = COL.ink; ctx.stroke();
+    pill(h.label, x, ay + dir * 36, 16, COL.yel, COL.ink);
+  }
+}
+function drawSignal() {
+  const s = state.signal; if (!s) return;
+  const [x, y] = scr(s.x, 0.05, s.z), r = 18 + Math.sin(animT * 10) * 4;
+  ctx.beginPath(); ctx.ellipse(x, y, r, r * 0.55, 0, 0, 7);
+  ctx.lineWidth = 5; ctx.strokeStyle = COL.ink; ctx.stroke(); ctx.lineWidth = 3; ctx.strokeStyle = COL.yel; ctx.stroke();
+  pill('¡Aquí!', x, y - 30, 14, COL.yel, COL.ink);
+}
+function drawFloaters() {
+  for (const f of state.floaters) {
+    const [x, y] = scr(f.x, f.y + f.t * 0.6, f.z), [bg, fg] = FLOAT_STYLE[f.style];
+    ctx.save(); ctx.globalAlpha = f.t > 1.1 ? Math.max(0, (1.5 - f.t) / 0.4) : 1;
+    pill(f.text, x, y, 15, bg, fg); ctx.restore();
+  }
+}
+function drawTopBar() {
+  panel(14, 10, 230, 62, COL.mag);
+  text('Venta del turno', 30, 27, 14, '#FFFFFF', 'left');
+  text(soles(state.money), 30, 52, 28, '#FFFFFF', 'left');
+  panel(W / 2 - 112, 10, 224, 62, COL.mag);
+  if (state.tutor) {
+    text(`Tutorial · paso ${Math.min(state.tutor.i + 1, TUT_STEPS.length)} de ${TUT_STEPS.length}`, W / 2, 27, 14, '#FFFFFF');
+    text('Sin reloj', W / 2, 52, 26, '#FFFFFF');
+  } else {
+    text(`${DIFF_NAME[diff]} · ${PHASE_NAME[state.phase]}`, W / 2, 27, 14, '#FFFFFF');
+    text(fmtTime(tune.shift_length - state.t), W / 2, 52, 28, '#FFFFFF');
+  }
+  panel(W - 304, 10, 290, 62, COL.mag);
+  text('Satisfacción', W - 290, 27, 14, '#FFFFFF', 'left');
+  text(Math.max(0, Math.ceil(state.sat)) + ' %', W - 28, 27, 14, '#FFFFFF', 'right');
+  const f = state.sat / 100;
+  meter(W - 290, 40, 262, 20, f, f > 0.5 ? COL.green : f > 0.25 ? COL.amber : (Math.sin(animT * 10) > 0 ? COL.red : '#8E1D22'));
+  const slots = [262, 330, 398, 462, 772, 840, 908]; // hot-food tickets between the panels
+  let i = 0;
+  for (const c of state.pickup) {
+    if (c.served || i >= slots.length) continue;
+    const x = slots[i++], f2 = c.arrivedOnce ? c.patience / c.pmax : 1;
+    panel(x, 12, 60, 58, COL.yel, COL.ink, 3, 8); drawFoodIcon(c.order, x + 30, 32, 34); meter(x + 6, 52, 48, 11, f2, patCol(f2));
+  }
+}
+function drawBanner() {
+  const b = state.banner; if (!b || b.t > 2.6) return;
+  const k = Math.min(1, b.t * 6), a = b.t > 2.2 ? (2.6 - b.t) / 0.4 : 1;
+  ctx.save(); ctx.globalAlpha = Math.max(0, a); ctx.translate(W / 2, 150); ctx.scale(0.6 + 0.4 * k, 0.6 + 0.4 * k);
+  setFont(34); const w = ctx.measureText(b.text).width + 60;
+  panel(-w / 2, -32, w, 64, COL.yel, COL.ink, 4, 14); text(b.text, 0, 2, 34, COL.ink);
+  ctx.restore();
+}
+function drawControlsStrip() {
+  if (state.t > 25 || state.tutor) return;
+  const lines = mode2P ? [CONTROLS[0], CONTROLS[1]] : [CONTROLS[0]];
+  lines.forEach((l, i) => {
+    setFont(14); const w = ctx.measureText(l).width + 24, y = H - 26 - (lines.length - 1 - i) * 30;
+    panel(14, y - 13, w, 26, '#FFFFFF', COL.ink, 2, 8); text(l, 26, y + 1, 14, COL.ink, 'left');
+  });
+}
+function drawPlayHUD() {
+  ctx.clearRect(0, 0, W, H);
+  if (!renderer) { ctx.fillStyle = COL.plum; ctx.fillRect(0, 0, W, H); text('Este juego necesita WebGL en el navegador.', W / 2, H / 2, 24, '#FFFFFF'); }
+  drawAlerts(); drawCustomersHUD(); drawOvensHUD(); drawSignal(); drawWorkersHUD(); drawHints(); drawFloaters();
+  drawTopBar(); drawBanner(); drawControlsStrip(); drawTutor();
+  if (muted) pill('Silencio (M)', W - 80, H - 26, 14, '#FFFFFF', COL.ink);
+}
+function wash(c) { ctx.fillStyle = c; ctx.fillRect(0, 0, W, H); }
+function drawTitle() {
+  ctx.clearRect(0, 0, W, H);
+  if (!renderer) { ctx.fillStyle = COL.plum; ctx.fillRect(0, 0, W, H); }
+  wash('rgba(29, 10, 24, 0.6)');
+  panel(W / 2 - 300, 46, 600, 124, COL.mag, COL.ink, 5, 18);
+  drawStar(W / 2 - 252, 108, 24, COL.yel); drawStar(W / 2 + 252, 108, 24, COL.yel);
+  text(TITLE.toUpperCase(), W / 2, 96, 60, '#FFFFFF');
+  text('Un turno de 4 minutos en la tienda 24 horas', W / 2, 146, 20, '#FFFFFF');
+  const card = (x, title, lines, on) => {
+    panel(x, 196, 400, 196, on ? COL.mag : '#FFFFFF', COL.ink, 4, 14);
+    const fg = on ? '#FFFFFF' : COL.ink;
+    text(title, x + 24, 228, 26, fg, 'left');
+    lines.forEach((l, i) => text(l, x + 24, 268 + i * 32, 18, fg, 'left', i === 0 && !on ? 'bold' : 'normal'));
+  };
+  card(W / 2 - 420, 'J1', ['WASD: moverse', 'E: agarrar / soltar', 'F: trabajar (mantener)', 'Q: avisar al compañero'], true);
+  if (mode2P) card(W / 2 + 20, 'J2', ['Flechas: moverse', 'K: agarrar / soltar', 'L: trabajar (mantener)', 'J: avisar al compañero'], true);
+  else card(W / 2 + 20, 'J2: ¿juegan dos?', ['Pulsa K para unirte.', 'Si no, te acompaña el BOT:', 'cobra, cocina, repone y limpia', 'lo que tú no estés haciendo.'], false);
+  text('Dificultad', W / 2, 420, 16, '#FFFFFF');
+  DIFFS.forEach((d, i) => pill(`${i + 1} ${DIFF_NAME[d]}`, W / 2 + (i - 1.5) * 168, 456, 20, d === diff ? COL.yel : '#FFFFFF', COL.ink));
+  text(DIFF_DESC[diff], W / 2, 494, 16, '#FFFFFF', 'center', 'normal');
+  pill('Enter: empezar el turno', W / 2, 544, 24, COL.yel, COL.ink);
+  text('P: pausa · M: silencio · K: entra o sale J2 · 1 a 4 o A / D: modo', W / 2, 594, 16, '#FFFFFF', 'center', 'normal');
+  text('Gana soles cobrando, entregando y limpiando. Si la satisfacción llega a cero, se pierde el turno.', W / 2, 624, 16, '#FFFFFF', 'center', 'normal');
+}
+const DIFF_DESC = {
+  facil: 'Menos clientes, más paciencia; la comida tarda más en quemarse.',
+  tutorial: 'Paso a paso y sin reloj: aprende cada tarea antes de jugar.',
+  intermedio: 'El ritmo normal del turno.',
+  dificil: 'Más clientes, menos paciencia, más derrames; la comida se quema rápido.',
+};
+function drawPause() {
+  drawPlayHUD(); wash('rgba(29, 10, 24, 0.62)');
+  panel(W / 2 - 340, 190, 680, 320, COL.mag, COL.ink, 4, 16);
+  text('Pausa', W / 2, 240, 44, '#FFFFFF');
+  const lines = mode2P ? CONTROLS : [CONTROLS[0], CONTROLS[2]];
+  lines.forEach((l, i) => text(l, W / 2, 304 + i * 36, 16, '#FFFFFF', 'center', 'normal'));
+  pill('P o Esc: seguir', W / 2, 440, 20, COL.yel, COL.ink);
+  pill('T: volver al inicio', W / 2, 482, 18, '#FFFFFF', COL.ink);
+}
+function drawOver() {
+  drawPlayHUD(); wash('rgba(40, 6, 12, 0.66)');
+  panel(W / 2 - 330, 180, 660, 330, '#FFFFFF', COL.ink, 4, 16);
+  panel(W / 2 - 330, 180, 660, 70, COL.mag, COL.ink, 4, 16);
+  text('Turno perdido', W / 2, 216, 38, '#FFFFFF');
+  text('La satisfacción de la tienda llegó a cero.', W / 2, 292, 20, COL.ink, 'center', 'normal');
+  text(`Venta: ${soles(state.money)} · Aguantaron ${fmtTime(state.t)} de ${fmtTime(tune.shift_length)}`, W / 2, 330, 20, COL.ink, 'center', 'normal');
+  text(`Clientes molestos: ${state.angry}`, W / 2, 366, 18, COL.ink, 'center', 'normal');
+  pill('R o Enter: reintentar el turno', W / 2, 424, 22, COL.yel, COL.ink);
+  pill('Esc: volver al inicio (cambiar dificultad)', W / 2, 474, 20, '#FFFFFF', COL.ink);
+}
+function drawResults() {
+  drawPlayHUD(); wash('rgba(29, 10, 24, 0.62)');
+  const X = W / 2 - 380, Y = 84, PW = 760, PH = 560;
+  panel(X, Y, PW, PH, '#FFFFFF', COL.ink, 4, 16);
+  panel(X, Y, PW, 64, COL.mag, COL.ink, 4, 16);
+  text('¡Turno terminado!', W / 2, Y + 33, 34, '#FFFFFF');
+  for (let i = 0; i < 3; i++) drawStar(W / 2 - 90 + i * 90, Y + 114, 32, i < state.stars && state.resT > 0.4 + i * 0.45 ? COL.yel : '#D9D6DE');
+  text(`Venta del turno: ${soles(state.money)}`, W / 2, Y + 176, 26, COL.ink);
+  text(`Atendidos: ${state.served} · Se fueron molestos: ${state.angry} · Satisfacción: ${Math.ceil(state.sat)} %`, W / 2, Y + 208, 16, COL.ink, 'center', 'normal');
+  text(`${DIFF_NAME[diff]}: dos estrellas desde ${soles(starGoal(2))} · tres desde ${soles(starGoal(3))}`, W / 2, Y + 232, 14, '#4A4452', 'center', 'normal');
+  const rows = [['Cobros en caja', 'ventas'], ['Pedidos de comida', 'pedidos'], ['Reposiciones', 'repos'], ['Limpiezas', 'limpiezas'], ['Bolsas de basura', 'bolsas'], ['Levantó al compañero', 'ayudas'], ['Resbalones', 'resbalones'], ['Choques', 'choques'], ['Aporte en soles', 'soles']];
+  const c1 = W / 2 + 120, c2 = W / 2 + 270, top = Y + 270;
+  state.workers.forEach((w, i) => pill(w.name, i ? c2 : c1, top, 16, w.id === 'p1' ? COL.mag : w.id === 'p2' ? '#FFFFFF' : '#3B3742', w.id === 'p2' ? COL.ink : '#FFFFFF'));
+  rows.forEach(([label, k], r) => {
+    const y = top + 34 + r * 24;
+    if (r % 2 === 0) { ctx.fillStyle = '#F4EEF3'; ctx.fillRect(X + 40, y - 12, PW - 80, 24); }
+    text(label, X + 60, y, 16, COL.ink, 'left', 'normal');
+    state.workers.forEach((w, i) => text(k === 'soles' ? soles(w.stats.soles) : String(w.stats[k]), i ? c2 : c1, y, 16, COL.ink));
+  });
+  pill('Enter: otro turno · Esc: título', W / 2, Y + PH - 28, 20, COL.yel, COL.ink);
+}
+function buildFigures() { // every unit and thing side by side, for the outline check
+  figScene = new T3.Scene(); addLights(figScene); figScene.background = new T3.Color('#F4F0F5');
+  const floor = new T3.Mesh(new T3.PlaneGeometry(30, 14), mat('#E9E4EE')); floor.rotation.x = -Math.PI / 2; figScene.add(floor);
+  const people = [['J1', makeWorker('j1')], ['J2', makeWorker('j2')], ['BOT', makeWorker('bot')], ['Escolar', makeCustomer('escolar', 0)], ['Abuelita', makeCustomer('abuelita', 1)], ['Oficinista', makeCustomer('oficinista', 2)], ['Obrero', makeCustomer('obrero', 3)], ['Deportista', makeCustomer('deportista', 1)]];
+  people.forEach(([name, c], i) => { const x = (i - 3.5) * 1.3; c.g.position.set(x, 0, 0); c.g.rotation.y = 0.35; figScene.add(c.g); figLabels.push({ name, x, y: 0, z: 0.6 }); });
+  const things = [['Caja de snacks', boxMesh('snacks')], ['Caja de bebidas', boxMesh('bebidas')], ['Empanada', foodMesh('empanada')], ['Hamburguesa', foodMesh('hamburguesa')], ['Postre', foodMesh('postre')], ['Caja congelada', foodBoxMesh('postre')], ['Trapeador', mopMesh()], ['Bolsa', bagMesh()], ['Derrame', spillMesh('liquid')]];
+  things.forEach(([name, m], i) => { const x = (i - 4) * 1.08; m.position.set(x, 0, 2.3); m.scale.setScalar(name === 'Trapeador' ? 0.8 : name === 'Derrame' ? 1.1 : 1.4); m.rotation.y = 0.5; figScene.add(m); figLabels.push({ name, x, y: 0, z: 2.95 }); });
+  figCam = new T3.PerspectiveCamera(34, W / H, 0.1, 100); figCam.position.set(0, 4.6, 9.4); figCam.lookAt(0, 0.6, 1.0); figCam.updateMatrixWorld(true);
+}
+function drawFigures() {
+  ctx.clearRect(0, 0, W, H);
+  if (!renderer) { ctx.fillStyle = COL.plum; ctx.fillRect(0, 0, W, H); text('Este juego necesita WebGL en el navegador.', W / 2, H / 2, 24, '#FFFFFF'); return; }
+  if (!figScene) buildFigures();
+  renderer.render(figScene, figCam);
+  text(`Figuras de ${TITLE}`, W / 2, 36, 28, COL.ink);
+  for (const l of figLabels) {
+    V3.set(l.x, l.y, l.z).project(figCam);
+    pill(l.name, (V3.x + 1) / 2 * W, (1 - V3.y) / 2 * H, 15, '#FFFFFF', COL.ink);
+  }
+}
+
+// ---- The tutorial: one task at a time. A short card pauses the shop; Enter, then you do it ------
+// Each step: a title and one or two short lines; setup() makes the situation; done() says when
+// the task is finished (no done(): a card to read only); where() points the yellow arrow.
+const at = (f, label, y = 1.2) => ({ x: f.x + 0.5, y, z: f.z + 0.5, label });
+const holding = pred => state.workers.some(w => w.held && pred(w.held));
+const TUT_STEPS = [
+  { title: 'Tu turno en la tienda', lines: ['Muévete con WASD (J2: flechas).', 'Camina un poco por la tienda.'],
+    setup() { const w = state.workers[0]; state.tutor.x0 = w.x; state.tutor.z0 = w.z; },
+    done: () => Math.hypot(state.workers[0].x - state.tutor.x0, state.workers[0].z - state.tutor.z0) > 2.5 },
+  { title: 'Reponer las góndolas', lines: ['Los clientes vacían las góndolas. Trae una caja de snacks', 'del almacén con E y mantén F frente a la góndola.'],
+    setup() { shelves.snacks.stock = 0; },
+    done: () => shelves.snacks.stock >= shelves.snacks.cap,
+    where: () => holding(i => i.kind === 'box' && i.prod === 'snacks') ? { x: shelves.snacks.cx, y: 1.5, z: shelves.snacks.cz, label: 'Mantén F aquí' } : at(crates.snacks, 'Caja de snacks', 1.1) },
+  { title: 'Cobrar en caja', lines: ['Los clientes hacen una sola cola para las dos cajas.', 'Párate detrás de la caja con cliente y mantén F.'],
+    setup() { state.tutor.base = state.served; spawnCustomer('escolar', ['galletas'], null); },
+    done: () => state.served > state.tutor.base,
+    where: () => { const t = tills.find(t => t.cust && t.cust.atSlot); return t ? at(t, 'Mantén F para cobrar', 1.3) : null; } },
+  { title: 'Pedido de comida caliente', lines: ['Saca la hamburguesa de la vitrina fría (E), caliéntala en el', 'horno y llévala a ENTREGA. Si se pasa, se quema.'],
+    setup() { state.tutor.base = state.served; spawnCustomer('oficinista', [], 'hamburguesa'); },
+    done: () => state.served > state.tutor.base,
+    where: () => state.pickup.some(c => !c.served) ? hotHint('hamburguesa') : null },
+  { title: 'Postres', lines: ['El postre va frío: de la vitrina fría', 'directo a ENTREGA, sin horno.'],
+    setup() { state.tutor.base = state.served; spawnCustomer('abuelita', [], 'postre'); },
+    done: () => state.served > state.tutor.base,
+    where: () => state.pickup.some(c => !c.served) ? hotHint('postre') : null },
+  { title: 'Reponer la vitrina fría', lines: ['Se acabaron las empanadas. Trae una caja del congelador', 'del almacén y mantén F frente a la vitrina fría.'],
+    setup() { display.stock.empanada = 0; },
+    done: () => display.stock.empanada >= tune.display_cap,
+    where: () => holding(i => i.kind === 'foodbox' && i.food === 'empanada') ? at(display, 'Mantén F aquí', 1.6) : at(freezers.empanada, 'Caja de empanadas', 1.1) },
+  { title: 'Pasar cosas por el mostrador', lines: ['Deja algo sobre el mostrador con E y quien está', 'del otro lado lo toma con E. Ahorra la vuelta.'] },
+  { title: 'Derrames', lines: ['Quien pisa un charco se resbala y suelta lo que lleva.', 'Trae el trapeador y mantén F junto al charco.'],
+    setup() { makeSpill(8.5, 8.5, 'liquid'); },
+    done: () => state.spills.length === 0,
+    where: () => { const s = state.spills[0]; if (!s) return null; return state.mop.place === 'held' ? { x: s.x, y: 0.6, z: s.z, label: 'Mantén F aquí' } : { ...(([x, z]) => ({ x, z }))(itemXZ(state.mop)), y: 1.0, label: 'Trapeador' }; } },
+  { title: 'El tacho de basura', lines: ['El tacho se llenó. Saca la bolsa con E y', 'llévala al contenedor verde del almacén.'],
+    setup() { bin.fill = tune.bin_cap; },
+    done: () => bin.fill === 0 && !state.items.some(i => i.kind === 'bag'),
+    where: () => holding(i => i.kind === 'bag') ? at(dumpster, 'Contenedor', 1.2) : at(bin, 'Saca la bolsa', 1.1) },
+  { title: 'Resbalones y choques', lines: ['Si tu compañero se resbala, mantén F a su lado para levantarlo.', 'Chocar de frente corriendo tira lo que cargan los dos.'] },
+  { title: 'Avisar', lines: ['Pulsa Q (J2: J) para marcar un punto con sonido.', 'El BOT va a ayudar ahí. Pruébalo.'],
+    setup() { state.tutor.signaled = false; },
+    done: () => state.tutor.signaled },
+  { title: 'Satisfacción y estrellas', lines: ['Clientes molestos, góndolas vacías y derrames bajan la satisfacción:', 'en cero se pierde el turno. Más soles, más estrellas.'] },
+  { title: '¡Listo para tu turno!', lines: ['Ya sabes hacer todo. Enter vuelve al inicio:', 'elige Fácil, Intermedio o Difícil.'], last: true },
+];
+function tutorUpdate() { // true while a card is up
+  const T = state.tutor, s = TUT_STEPS[T.i];
+  if (T.card) {
+    if (pressed('Enter') || pressed('Space')) {
+      if (s.last) { diff = 'facil'; reset(); scene = 'title'; return true; }
+      T.card = false; sfx.grab();
+      if (s.setup) s.setup();
+      if (!s.done) { T.i++; T.card = true; }
+    }
+    return true;
+  }
+  if (s.done()) { sfx.task(); banner('¡Bien hecho!'); T.i++; T.card = true; }
+  return false;
+}
+function drawTutor() {
+  const T = state.tutor; if (!T) return;
+  const s = TUT_STEPS[Math.min(T.i, TUT_STEPS.length - 1)];
+  if (!T.card) { pill(`Paso ${T.i + 1}: ${s.title}`, W / 2, H - 28, 16, '#FFFFFF', COL.ink); return; }
+  ctx.fillStyle = 'rgba(29, 10, 24, 0.35)'; ctx.fillRect(0, 0, W, H);
+  const X = W / 2 - 380, Y = H - 250, PW = 760, PH = 200;
+  panel(X, Y, PW, PH, COL.mag, COL.ink, 4, 16);
+  text(`Paso ${T.i + 1} de ${TUT_STEPS.length}`, X + 24, Y + 28, 14, '#FFFFFF', 'left', 'normal');
+  text(s.title, W / 2, Y + 54, 28, '#FFFFFF');
+  s.lines.forEach((l, i) => text(l, W / 2, Y + 96 + i * 30, 18, '#FFFFFF', 'center', 'normal'));
+  pill(s.last ? 'Enter: volver al inicio' : s.done ? 'Enter: a hacerlo' : 'Enter: entendido', W / 2, Y + PH - 26, 18, COL.yel, COL.ink);
+}
+
+// ---- Scenes: title, play, pause, lost shift, results, figures --------------------------------
+const scenes = {
+  figures: {
+    update(dt) { state.t += dt; animT += dt; },
+    draw() { drawFigures(); },
+  },
+  title: {
+    update(dt) {
+      animT += dt;
+      if (pressed('KeyK')) { mode2P = !mode2P; reset(); sfx.signal(); }
+      const pickDiff = i => { diff = DIFFS[(i + DIFFS.length) % DIFFS.length]; sfx.grab(); };
+      ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Numpad1', 'Numpad2', 'Numpad3', 'Numpad4'].forEach((k, i) => { if (pressed(k)) pickDiff(i % 4); });
+      if (pressed('KeyA') || pressed('ArrowLeft')) pickDiff(DIFFS.indexOf(diff) - 1);
+      if (pressed('KeyD') || pressed('ArrowRight')) pickDiff(DIFFS.indexOf(diff) + 1);
+      if (pressed('Enter') || pressed('Space')) { reset(); scene = 'play'; sfx.banner(); }
+    },
+    draw() { render3D(); drawTitle(); },
+  },
+  play: {
+    update(dt) {
+      if (pressed('KeyP') || pressed('Escape')) { scene = 'pause'; return; }
+      if (state.tutor && tutorUpdate()) return; // a tutorial card is up: the shop waits
+      state.t += dt; animT += dt;
+      if (!state.tutor) director(dt);
+      for (const w of state.workers) updateWorker(w, dt);
+      workerCollisions();
+      for (const c of state.customers) updateCustomer(c, dt);
+      cleanCustomers();
+      updateItems(dt);
+      updateMess(dt);
+      updateFX(dt);
+      state.score = Math.round(state.money);
+      if (state.sat <= 0) { state.sat = 0; state.gained = 'Turno perdido'; scene = 'over'; sfx.lose(); events.push({ type: 'lose', t: state.t }); }
+      else if (state.t >= tune.shift_length && !state.tutor) finishShift();
+    },
+    draw() { render3D(); drawPlayHUD(); },
+  },
+  pause: {
+    update() {
+      if (pressed('KeyP') || pressed('Escape')) scene = 'play';
+      else if (pressed('KeyT')) { reset(); scene = 'title'; }
+    },
+    draw() { render3D(); drawPause(); },
+  },
+  over: {
+    update() {
+      if (pressed('KeyR') || pressed('Enter')) { reset(); scene = 'play'; }
+      else if (pressed('Escape') || pressed('KeyT')) { reset(); scene = 'title'; }
+    },
+    draw() { render3D(); drawOver(); },
+  },
+  results: {
+    update(dt) {
+      const before = state.resT; state.resT += dt;
+      for (let i = 0; i < state.stars; i++) { const at = 0.4 + i * 0.45; if (before < at && state.resT >= at) sfx.star(i); }
+      if (pressed('Enter')) { reset(); scene = 'play'; }
+      else if (pressed('Escape')) { reset(); scene = 'title'; }
+    },
+    draw() { render3D(); drawResults(); },
+  },
+};
+
+// ---- Loop: fixed step, frame time clamped ---------------------------------------------
+function step() {
+  if (pressed('KeyM')) { setMuted(!muted); hit.delete('KeyM'); }
+  scenes[scene].update(STEP); hit.clear();
+}
+let last, acc = 0, ALPHA = 1; // ALPHA: how far the frame is between the last two steps
+function tick() {
+  const now = clock.now();
+  acc += Math.min(now - last, 0.25); last = now; // a stall never fast-forwards the game
+  while (acc >= STEP) { step(); acc -= STEP; }
+  ALPHA = acc / STEP;
+  drawFrame();
+}
+function drawFrame() { scenes[scene].draw(); }
+function frame() { tick(); requestAnimationFrame(frame); }
+// A headless browser on a time budget runs timers but almost no animation frames: a timer
+// ticks when no frame has come for 100 ms on a visible page; a hidden tab stays paused.
+function timer() { if (document.visibilityState === 'visible' && clock.now() - last > 0.1) tick(); }
+
+// ---- What a check can read and drive (?manual=1 stops the loop; players never see it) ----
+window.game = {
+  get scene() { return scene; },
+  get state() { return state; },
+  press(code) { hit.add(code); },
+  hold(code, on) { on ? down.add(code) : down.delete(code); },
+  get events() { return events; }, // the loop steps; a check empties it
+  step(n = 1, draw = true, alpha = 1) {
+    for (let i = 0; i < n; i++) step();
+    if (draw) { ALPHA = alpha; drawFrame(); }
+  },
+};
+
+initThree();
+reset();
+scene = params.get('scene') || 'title';
+last = clock.now(); lastDraw = last;
+if (params.get('manual') === '1') drawFrame();
+else { requestAnimationFrame(frame); setInterval(timer, 50); }
+</script>
+</body>
+</html>
