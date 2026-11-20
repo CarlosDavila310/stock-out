@@ -17,7 +17,9 @@
 <canvas id="world"></canvas>
 <canvas id="game"></canvas>
 <script src="vendor/three.js"></script>
+<script src="vendor/peerjs.min.js"></script>
 <script src="config.js"></script>
+<script src="net.js"></script>
 <script>
 'use strict';
 // Stock Out! Two store workers (or one and a bot) get through a 4-minute shift in a 24-hour
@@ -119,6 +121,15 @@ addEventListener('blur', () => down.clear());
 const KEYS = {
   p1: { up: 'KeyW', down: 'KeyS', left: 'KeyA', right: 'KeyD', grab: 'KeyE', work: 'KeyF', signal: 'KeyQ' },
   p2: { up: 'ArrowUp', down: 'ArrowDown', left: 'ArrowLeft', right: 'ArrowRight', grab: 'KeyK', work: 'KeyL', signal: 'KeyJ' },
+};
+// Who stands where, wears what and is called what. Online, every browser plays with the J1 keys
+// and the host is always J1; the bot, when asked for, takes the last place.
+const PLAYERS = {
+  p1: { name: 'J1', view: 'j1', start: [8.5, 5.5, 0, 1], pill: ['#AF1280', '#FFFFFF'] },
+  p2: { name: 'J2', view: 'j2', start: [15.5, 8.5, -1, 0], pill: ['#FFFFFF', '#111111'] },
+  p3: { name: 'J3', view: 'j3', start: [4.5, 8.5, 1, 0], pill: ['#FFEE0C', '#111111'] },
+  p4: { name: 'J4', view: 'j4', start: [10.5, 3.5, 0, 1], pill: ['#F2A33A', '#111111'] },
+  bot: { name: 'BOT', view: 'bot', start: [15.5, 8.5, -1, 0], pill: ['#3B3742', '#FFFFFF'] },
 };
 
 // ---- Audio: started on first input, mute on M --------------------------------------------
@@ -296,8 +307,10 @@ const DIFF_NAME = { tutorial: 'Tutorial', facil: 'Fácil', intermedio: 'Intermed
 let diff = 'intermedio';
 const diffKey = name => (diff === 'dificil' ? 'hard_' : 'easy_') + name; // the tutorial runs on Fácil's values
 function dm(name) { return diff === 'intermedio' ? 1 : tune[diffKey(name)]; } // a multiplier
-function maxCustomers() { return diff === 'intermedio' ? tune.max_customers : tune[diffKey('max_customers')]; }
-function starGoal(n) { return diff === 'intermedio' ? tune['star' + n] : tune[diffKey('star' + n)]; }
+// With more than two workers the store fills faster and the stars cost more: 1 with two or fewer.
+function crowd() { const n = state && state.workers ? state.workers.length : 2; return 1 + tune.online_crowd_gain * Math.max(0, n - 2); }
+function maxCustomers() { return Math.round((diff === 'intermedio' ? tune.max_customers : tune[diffKey('max_customers')]) * crowd()); }
+function starGoal(n) { return (diff === 'intermedio' ? tune['star' + n] : tune[diffKey('star' + n)]) * crowd(); }
 function burnTime() { return tune.burn_time * dm('burn'); }
 function foodState(it) {
   if (COLD(it.food)) return 'ready';
@@ -398,7 +411,8 @@ function makeChar(o) {
 }
 function makeWorker(style) {
   const robot = style === 'bot';
-  const c = makeChar({ h: 1, w: 1, shirt: COL.mag, pants: '#2F2A36', skin: style === 'j2' ? COL.skin[2] : COL.skin[1], hand: robot ? '#C9CED8' : null, robot });
+  const skin = { j1: COL.skin[1], j2: COL.skin[2], j3: COL.skin[0], j4: COL.skin[3] }[style] || COL.skin[1];
+  const c = makeChar({ h: 1, w: style === 'j4' ? 1.14 : 1, shirt: COL.mag, pants: '#2F2A36', skin, hand: robot ? '#C9CED8' : null, robot });
   // the store's uniform: a black apron over the magenta shirt, tied at the waist, a white name tag
   c.body.add(part(BOX(0.3, c.torsoH * 0.8, 0.03), COL.black, 0, c.legH + c.torsoH * 0.42, 0.205, 0.012));
   c.body.add(part(CYL(0.235, 0.235, 0.04, 12), COL.black, 0, c.legH + 0.04, 0, 0));
@@ -406,7 +420,17 @@ function makeWorker(style) {
   if (!robot) { // a black cap with its peak and a magenta patch
     c.head.add(part(DOME(c.hr * 1.05), COL.black, 0, c.hr * 0.08, 0, 0.02));
     c.head.add(part(BOX(0.28, 0.035, 0.2), COL.black, 0, c.hr * 0.16, c.hr * 0.98, 0.014));
-    c.head.add(part(BOX(0.09, 0.06, 0.02), COL.mag, 0, c.hr * 0.6, c.hr * 0.88, 0));
+    // the cap's patch tells the players apart: magenta, magenta, yellow, amber
+    c.head.add(part(BOX(0.09, 0.06, 0.02), { j3: COL.yel, j4: COL.amber }[style] || COL.mag, 0, c.hr * 0.6, c.hr * 0.88, 0));
+  }
+  if (style === 'j3') { // two pigtails swinging out at the sides of the cap
+    for (const sx of [-1, 1]) {
+      c.head.add(part(SPH(0.095, 8, 6), '#1E1D22', sx * c.hr * 1.12, -c.hr * 0.05, -0.04, 0.016));
+      c.head.add(part(CYL(0.05, 0.028, 0.22, 8), '#1E1D22', sx * c.hr * 1.12, -c.hr * 0.42, -0.04, 0.014));
+    }
+  } else if (style === 'j4') { // a full beard under the cap
+    c.head.add(part(BOX(c.hr * 1.5, 0.15, 0.16), '#2A1D16', 0, -c.hr * 0.55, c.hr * 0.62, 0.016));
+    c.head.add(part(SPH(0.085, 8, 6), '#2A1D16', 0, -c.hr * 0.38, c.hr * 0.95, 0.012));
   }
   if (style === 'j2') { // long hair down both sides of the face, and a ponytail out of the back of the cap
     for (const sx of [-1, 1]) c.head.add(part(BOX(0.08, 0.34, 0.2), '#3B2418', sx * c.hr * 0.98, -c.hr * 0.3, -0.03, 0.016));
@@ -950,8 +974,8 @@ function initThree() {
   addLights(world3);
   for (const p of PRODS) shelves[p].cap = shelves[p].fridge ? tune.fridge_cap : tune.shelf_cap; // the slots are built from it
   buildStore();
-  for (const s of ['j1', 'j2', 'bot']) { views[s] = makeWorker(s); views[s].g.visible = false; views[s].g.scale.setScalar(tune.figure_scale); world3.add(views[s].g); }
-  for (let i = 0; i < 2; i++) { const h = { floor: frameMesh(1, 1), top: frameMesh(1, 1) }; h.floor.visible = h.top.visible = false; world3.add(h.floor, h.top); HL.push(h); }
+  for (const s of ['j1', 'j2', 'j3', 'j4', 'bot']) { views[s] = makeWorker(s); views[s].g.visible = false; views[s].g.scale.setScalar(tune.figure_scale); world3.add(views[s].g); }
+  for (let i = 0; i < 4; i++) { const h = { floor: frameMesh(1, 1), top: frameMesh(1, 1) }; h.floor.visible = h.top.visible = false; world3.add(h.floor, h.top); HL.push(h); }
   frameCamera();
   fit();
 }
@@ -962,11 +986,15 @@ function newWorker(id, name, isBot, x, z) {
   return {
     id, name, isBot, x, z, vx: 0, vz: 0, fx: 0, fz: 1, held: null, down: 0, stun: 0, immune: 0, spin: 0,
     grabCd: 0, warnT: 0, workKind: null, workP: 0, target: null,
+    local: false, keys: id, remote: false, ovr: 0, lastG: 0, lastS: 0, nx: x, nz: z, ovrSeen: 0, // online: who drives it, and its latest spot from the host
+
     stats: { ventas: 0, pedidos: 0, repos: 0, limpiezas: 0, bolsas: 0, ayudas: 0, resbalones: 0, choques: 0, soles: 0 },
     bot: isBot ? { task: null, think: 0, act: 0, path: null, goalKey: '', repath: 0, stuckT: 0, lastX: x, lastZ: z, jitter: 0, jx: 0, jz: 0, near: null, said: false } : null,
     view: null,
   };
 }
+// Who works this shift: J1 and the bot, J1 and J2 on one keyboard, or the people in the online room (net.js).
+function rosterSpec() { return online() ? netRoster() : mode2P ? ['p1', 'p2'] : ['p1', 'bot']; }
 function reset() {
   seed = Number(params.get('seed')) || CONFIG.seed;
   if (state && world3) {
@@ -987,11 +1015,19 @@ function reset() {
   for (const k of FOODS) display.stock[k] = Math.min(tune.display_cap, tune.display_start);
   display.fill = 0;
   bin.fill = 0;
-  const p1 = newWorker('p1', 'J1', false, 8.5, 5.5);
-  const p2 = mode2P ? newWorker('p2', 'J2', false, 15.5, 8.5) : newWorker('bot', 'BOT', true, 15.5, 8.5);
-  p2.fx = -1; p2.fz = 0;
+  const ids = rosterSpec();
+  const workers = ids.map(id => {
+    const P = PLAYERS[id], st = id === 'bot' && ids.includes('p2') ? [16.5, 10.5, -1, 0] : P.start;
+    const w = newWorker(id, P.name, id === 'bot', st[0], st[1]);
+    w.fx = st[2]; w.fz = st[3];
+    w.local = !online() ? id !== 'bot' : id === net.myId;      // the keys of this browser drive it
+    w.keys = !online() ? id : 'p1';
+    w.remote = online() && id !== net.myId && id !== 'bot';    // another browser drives it
+    if (w.remote) w.lastG = w.lastS = -1;                      // its first report sets the counts: no phantom key press
+    return w;
+  });
   state = {
-    t: 0, score: 0, money: 0, sat: tune.sat_start, workers: [p1, p2], customers: [], items: [], spills: [], queue: [], pickup: [],
+    t: 0, score: 0, money: 0, sat: tune.sat_start, workers, customers: [], items: [], spills: [], queue: [], pickup: [],
     phase: 'tut', nextSpawn: 99, scriptIdx: 0, crunchIdx: 0, banner: diff === 'tutorial' ? null : { text: '¡Empieza el turno!', t: 0 }, floaters: [], signal: null,
     tut: { restock: false, cobro: false, hot: false, mop: false, display: false }, spawned: 0, served: 0, angry: 0, nextId: 1, lastCall: false,
     stars: 0, resT: 0, gained: '', mop: null, diff, tutor: diff === 'tutorial' ? { i: 0, card: true, base: 0, signaled: false } : null,
@@ -1000,7 +1036,7 @@ function reset() {
   if (world3) {
     for (const k in views) views[k].g.visible = false;
     for (const w of state.workers) {
-      w.view = views[w.id === 'p1' ? 'j1' : w.id === 'p2' ? 'j2' : 'bot'];
+      w.view = views[PLAYERS[w.id].view];
       w.view.g.visible = true; w.view.ang = Math.atan2(w.fx, w.fz);
     }
   }
@@ -1098,7 +1134,7 @@ function updateItems(dt) {
 
 // ---- Workers: walking, bumping, slipping, grabbing and working ---------------------------------
 function keyInput(w) {
-  const k = KEYS[w.id];
+  const k = KEYS[w.keys];
   const mx = (down.has(k.right) ? 1 : 0) - (down.has(k.left) ? 1 : 0);
   const mz = (down.has(k.down) ? 1 : 0) - (down.has(k.up) ? 1 : 0);
   return { mx, mz, grab: pressed(k.grab), work: down.has(k.work), signal: pressed(k.signal), face: null };
@@ -1118,6 +1154,14 @@ function collide(e, r = 0.3) { // push a circle out of solid tiles
     }
   }
 }
+function walk(w, inp, dt) { // one step of walking: heading, speed and the walls. A client uses it too, to walk its own figure at once.
+  let mx = inp.mx, mz = inp.mz; const m = Math.hypot(mx, mz);
+  if (m > 0.01) { mx /= m; mz /= m; w.fx = mx; w.fz = mz; }
+  else { mx = 0; mz = 0; if (inp.face) { w.fx = inp.face[0]; w.fz = inp.face[1]; } }
+  const sp = tune.walk_speed * (w.isBot ? tune.bot_speed : 1), k = Math.min(1, tune.accel * dt);
+  w.vx += (mx * sp - w.vx) * k; w.vz += (mz * sp - w.vz) * k;
+  w.x += w.vx * dt; w.z += w.vz * dt; collide(w);
+}
 function updateWorker(w, dt) {
   w.immune -= dt; w.grabCd -= dt; w.warnT -= dt;
   if (w.down > 0) { // on the floor, spinning, sliding to a stop
@@ -1127,17 +1171,13 @@ function updateWorker(w, dt) {
     if (w.down <= 0) { w.down = 0; w.immune = tune.slip_immune; }
     return;
   }
-  const inp = w.isBot ? botInput(w, dt) : keyInput(w);
+  const inp = w.isBot ? botInput(w, dt) : w.remote ? netRemoteInput(w) : keyInput(w);
   if (w.stun > 0) {
     w.stun -= dt; const k = Math.max(0, 1 - 6 * dt); w.vx *= k; w.vz *= k;
     w.x += w.vx * dt; w.z += w.vz * dt; collide(w); w.workKind = null; return;
   }
-  let mx = inp.mx, mz = inp.mz; const m = Math.hypot(mx, mz);
-  if (m > 0.01) { mx /= m; mz /= m; w.fx = mx; w.fz = mz; }
-  else { mx = 0; mz = 0; if (inp.face) { w.fx = inp.face[0]; w.fz = inp.face[1]; } }
-  const sp = tune.walk_speed * (w.isBot ? tune.bot_speed : 1), k = Math.min(1, tune.accel * dt);
-  w.vx += (mx * sp - w.vx) * k; w.vz += (mz * sp - w.vz) * k;
-  w.x += w.vx * dt; w.z += w.vz * dt; collide(w);
+  if (w.remote) netAdoptReport(w); // another browser walks it: take the spot and heading it reported
+  else walk(w, inp, dt);
   w.target = findTarget(w);
   if (inp.grab && w.grabCd <= 0) { w.grabCd = 0.15; doGrab(w, w.target); }
   if (inp.work) doWork(w, w.target, dt); else w.workKind = null;
@@ -1165,7 +1205,7 @@ function say(w, msg, style = 'info') { // a short line over a worker, not repeat
   if (w.warnT > 0) return;
   w.warnT = 1.0; floater(msg, w.x, 2.1, w.z, style);
 }
-const workKey = w => w.id === 'p2' ? 'L' : 'F';
+const workKey = w => w.keys === 'p2' ? 'L' : 'F';
 function doGrab(w, tg) {
   const f = tg.fx, held = w.held;
   if (held) {
@@ -1292,16 +1332,24 @@ function slip(w) {
   sfx.slip(); floater('¡Uy!', w.x, 2.0, w.z, 'mag'); events.push({ type: 'slip', who: w.name, t: state.t });
 }
 function workerCollisions() {
-  const [a, b] = state.workers;
-  const dx = b.x - a.x, dz = b.z - a.z, d = Math.hypot(dx, dz), minD = 0.6;
-  if (d < minD && d > 1e-4) {
-    const nx = dx / d, nz = dz / d, closing = (a.vx - b.vx) * nx + (a.vz - b.vz) * nz;
-    if (closing > tune.bump_speed && a.down <= 0 && b.down <= 0 && a.stun <= 0 && b.stun <= 0) bump(a, b, nx, nz);
-    const ov = minD - d;
-    if (a.isBot) { a.x -= nx * ov; a.z -= nz * ov; }      // the bot always gives way
-    else if (b.isBot) { b.x += nx * ov; b.z += nz * ov; }
-    else { a.x -= nx * ov / 2; a.z -= nz * ov / 2; b.x += nx * ov / 2; b.z += nz * ov / 2; }
-    collide(a); collide(b);
+  const ws = state.workers;
+  for (let i = 0; i < ws.length; i++) for (let j = i + 1; j < ws.length; j++) {
+    const a = ws[i], b = ws[j];
+    const dx = b.x - a.x, dz = b.z - a.z, d = Math.hypot(dx, dz), minD = 0.6;
+    if (d < minD && d > 1e-4) {
+      const nx = dx / d, nz = dz / d, closing = (a.vx - b.vx) * nx + (a.vz - b.vz) * nz;
+      if (closing > tune.bump_speed && a.down <= 0 && b.down <= 0 && a.stun <= 0 && b.stun <= 0) bump(a, b, nx, nz);
+      const ov = minD - d;
+      // The bot always gives way. A figure another browser walks takes its spot from that browser,
+      // so only the one the host walks is pushed out of the way (a pair of those stay overlapped).
+      if (a.isBot) { a.x -= nx * ov; a.z -= nz * ov; }
+      else if (b.isBot) { b.x += nx * ov; b.z += nz * ov; }
+      else if (a.remote && b.remote) { /* both come from their browsers */ }
+      else if (a.remote) { b.x += nx * ov; b.z += nz * ov; }
+      else if (b.remote) { a.x -= nx * ov; a.z -= nz * ov; }
+      else { a.x -= nx * ov / 2; a.z -= nz * ov / 2; b.x += nx * ov / 2; b.z += nz * ov / 2; }
+      collide(a); collide(b);
+    }
   }
   for (const w of state.workers) for (const c of state.customers) { // customers are soft: you squeeze past
     if (c.gone) continue;
@@ -1387,7 +1435,7 @@ function spawnCustomer(kind, list, order, opt = {}) {
     mood: '', leaveT: 0, gone: false, view: null, h: K.h, shelf: null,
   };
   c.patience = c.pmax;
-  if (world3) { c.view = makeCustomer(kind, Math.floor(rng() * 4)); c.view.g.position.set(c.x, 0, c.z); c.view.g.scale.setScalar(tune.figure_scale); c.view.ang = Math.PI; world3.add(c.view.g); }
+  if (world3) { c.skin = Math.floor(rng() * 4); c.view = makeCustomer(kind, c.skin); c.view.g.position.set(c.x, 0, c.z); c.view.g.scale.setScalar(tune.figure_scale); c.view.ang = Math.PI; world3.add(c.view.g); }
   state.customers.push(c); state.spawned++; sfx.chime();
   nextStage(c);
   return c;
@@ -1525,7 +1573,7 @@ function director(dt) {
     state.phase = ph;
     const msg = { apuro: '¡Se llena la tienda!', punta: '¡HORA PUNTA!', respiro: 'Respiro: ordena y cierra' }[ph];
     if (msg) banner(msg);
-    if (ph !== 'tut') state.nextSpawn = ph === 'apuro' ? tune.crunch_delay + 8 : tune['spawn_' + ph] * dm('spawn') * 0.5;
+    if (ph !== 'tut') state.nextSpawn = ph === 'apuro' ? tune.crunch_delay + 8 : tune['spawn_' + ph] * dm('spawn') / crowd() * 0.5;
     events.push({ type: 'phase', phase: ph, t });
   }
   while (state.scriptIdx < SCRIPT.length && t >= SCRIPT[state.scriptIdx].t) {
@@ -1539,7 +1587,7 @@ function director(dt) {
     state.nextSpawn -= dt;
     if (state.nextSpawn <= 0) {
       if (state.customers.length < maxCustomers()) spawnRandom();
-      state.nextSpawn = tune['spawn_' + ph] * dm('spawn') * (0.75 + rng() * 0.5);
+      state.nextSpawn = tune['spawn_' + ph] * dm('spawn') / crowd() * (0.75 + rng() * 0.5);
     }
   }
   if (!state.lastCall && t >= tune.shift_length - 10) { state.lastCall = true; banner('¡Últimos 10 segundos!'); }
@@ -1551,7 +1599,12 @@ function finishShift() {
 }
 
 // ---- The bot partner: picks the most urgent job the human is not doing, never blocks them ------
-const other = w => state.workers.find(o => o !== w);
+// The partner the bot looks after: the nearest human (with two, three or four of them, the one it is closest to).
+const other = w => {
+  let best = null, bd = 1e9;
+  for (const o of state.workers) if (o !== w && !o.isBot) { const d = Math.hypot(o.x - w.x, o.z - w.z); if (d < bd) { bd = d; best = o; } }
+  return best || state.workers.find(o => o !== w);
+};
 const waitingFor = food => state.pickup.some(c => !c.served && c.order === food);
 const humanHas = (h, pred) => h && !h.isBot && h.held && pred(h.held);
 const spillOn = (x, z) => state.spills.some(s => s.type === 'liquid' && Math.floor(s.x) === x && Math.floor(s.z) === z);
@@ -1839,7 +1892,7 @@ function syncHighlights() {
   state.workers.forEach((w, i) => {
     const h = HL[i]; if (!h) return;
     h.floor.visible = h.top.visible = false;
-    if (w.isBot || !w.target || w.down > 0) return;
+    if (w.isBot || !w.target || w.down > 0 || (online() && !w.local)) return; // online, you see only your own
     const tg = w.target;
     if (tg.fx) {
       const f = tg.fx, sh = f.type === 'shelf' ? f.shelf : null;
@@ -1890,7 +1943,7 @@ let lastDraw = 0;
 function render3D() {
   if (!renderer) return;
   const now = clock.now(), dt = clamp(now - lastDraw, 0, 0.05); lastDraw = now;
-  syncWorld(scene === 'play' || scene === 'title' ? dt : 0);
+  syncWorld(scene === 'play' || scene === 'title' || scene === 'netmenu' || scene === 'lobby' ? dt : 0);
   renderer.render(world3, camera);
 }
 
@@ -2023,12 +2076,12 @@ function drawOvensHUD() {
 function drawWorkersHUD() {
   for (const w of state.workers) {
     const [x, y] = scr(w.x, 1.15 * tune.figure_scale + 0.25, w.z);
-    const bg = w.id === 'p1' ? COL.mag : w.id === 'p2' ? '#FFFFFF' : '#3B3742', fg = w.id === 'p2' ? COL.ink : '#FFFFFF';
-    pill(w.name, x, y, 14, bg, fg);
+    const [bg, fg] = PLAYERS[w.id].pill;
+    pill(online() && w.local ? w.name + ' (tú)' : w.name, x, y, 14, bg, fg);
     if (w.workKind) meter(x - 26, y - 34, 52, 11, w.workP, COL.green);
     if (w.down > 0) {
       for (let i = 0; i < 3; i++) { const a = animT * 6 + i * 2.1; drawStar(x + Math.cos(a) * 22, y + 24 + Math.sin(a) * 6, 6, COL.yel); }
-      if (state.workers.some(o => o !== w && !o.isBot)) pill(`¡Levántame! (${w.id === 'p1' ? 'L' : 'F'})`, x, y - 30, 14, '#FFFFFF', COL.ink);
+      if (state.workers.some(o => o !== w && !o.isBot)) pill(`¡Levántame! (${w.keys === 'p1' && !online() ? 'L' : 'F'})`, x, y - 30, 14, '#FFFFFF', COL.ink);
     }
   }
 }
@@ -2051,7 +2104,7 @@ function hotHint(kind) {
 }
 function tutorialHints() { // the first minute's two-word nudges; gone once each task is done once
   const out = [], T = state.tut, wk = mode2P ? 'F / L' : 'F';
-  if (state.t > 100 || state.tutor) return out;
+  if (state.t > 100 || state.tutor || online()) return out; // online has no nudges: they read the host's state
   const anyHeld = pred => state.workers.some(w => w.held && pred(w.held));
   const sn = shelves.snacks;
   if (!T.restock && sn.stock === 0) {
@@ -2129,7 +2182,7 @@ function drawBanner() {
 }
 function drawControlsStrip() {
   if (state.t > 25 || state.tutor) return;
-  const lines = mode2P ? [CONTROLS[0], CONTROLS[1]] : [CONTROLS[0]];
+  const lines = mode2P ? [CONTROLS[0], CONTROLS[1]] : online() ? [CONTROLS[0].replace('J1: ', ''), 'Online: sin pausa'] : [CONTROLS[0]];
   lines.forEach((l, i) => {
     setFont(14); const w = ctx.measureText(l).width + 24, y = H - 26 - (lines.length - 1 - i) * 30;
     panel(14, y - 13, w, 26, '#FFFFFF', COL.ink, 2, 8); text(l, 26, y + 1, 14, COL.ink, 'left');
@@ -2163,8 +2216,9 @@ function drawTitle() {
   text('Dificultad', W / 2, 420, 16, '#FFFFFF');
   DIFFS.forEach((d, i) => pill(`${i + 1} ${DIFF_NAME[d]}`, W / 2 + (i - 1.5) * 168, 456, 20, d === diff ? COL.yel : '#FFFFFF', COL.ink));
   text(DIFF_DESC[diff], W / 2, 494, 16, '#FFFFFF', 'center', 'normal');
-  pill('Enter: empezar el turno', W / 2, 544, 24, COL.yel, COL.ink);
-  text('P: pausa · M: silencio · K: entra o sale J2 · 1 a 4 o A / D: modo', W / 2, 594, 16, '#FFFFFF', 'center', 'normal');
+  pill('Enter: empezar el turno', W / 2 - 150, 544, 24, COL.yel, COL.ink);
+  pill('O: jugar online (hasta 4)', W / 2 + 250, 544, 20, '#FFFFFF', COL.ink);
+  text('P: pausa · M: silencio · K: entra o sale J2 · 1 a 4 o A / D: modo · O: online', W / 2, 594, 16, '#FFFFFF', 'center', 'normal');
   text('Gana soles cobrando, entregando y limpiando. Si la satisfacción llega a cero, se pierde el turno.', W / 2, 624, 16, '#FFFFFF', 'center', 'normal');
 }
 const DIFF_DESC = {
@@ -2204,13 +2258,14 @@ function drawResults() {
   text(`Atendidos: ${state.served} · Se fueron molestos: ${state.angry} · Satisfacción: ${Math.ceil(state.sat)} %`, W / 2, Y + 208, 16, COL.ink, 'center', 'normal');
   text(`${DIFF_NAME[diff]}: dos estrellas desde ${soles(starGoal(2))} · tres desde ${soles(starGoal(3))}`, W / 2, Y + 232, 14, '#4A4452', 'center', 'normal');
   const rows = [['Cobros en caja', 'ventas'], ['Pedidos de comida', 'pedidos'], ['Reposiciones', 'repos'], ['Limpiezas', 'limpiezas'], ['Bolsas de basura', 'bolsas'], ['Levantó al compañero', 'ayudas'], ['Resbalones', 'resbalones'], ['Choques', 'choques'], ['Aporte en soles', 'soles']];
-  const c1 = W / 2 + 120, c2 = W / 2 + 270, top = Y + 270;
-  state.workers.forEach((w, i) => pill(w.name, i ? c2 : c1, top, 16, w.id === 'p1' ? COL.mag : w.id === 'p2' ? '#FFFFFF' : '#3B3742', w.id === 'p2' ? COL.ink : '#FFFFFF'));
+  const n = state.workers.length, gap = n > 3 ? 92 : n > 2 ? 130 : 150, c0 = n > 3 ? X + PW - 60 - (n - 1) * gap : n > 2 ? X + 420 : W / 2 + 120, top = Y + 270;
+  const colX = i => c0 + i * gap;
+  state.workers.forEach((w, i) => { const [bg, fg] = PLAYERS[w.id].pill; pill(w.name, colX(i), top, 16, bg, fg); });
   rows.forEach(([label, k], r) => {
     const y = top + 34 + r * 24;
     if (r % 2 === 0) { ctx.fillStyle = '#F4EEF3'; ctx.fillRect(X + 40, y - 12, PW - 80, 24); }
     text(label, X + 60, y, 16, COL.ink, 'left', 'normal');
-    state.workers.forEach((w, i) => text(k === 'soles' ? soles(w.stats.soles) : String(w.stats[k]), i ? c2 : c1, y, 16, COL.ink));
+    state.workers.forEach((w, i) => text(k === 'soles' ? soles(w.stats.soles) : String(w.stats[k]), colX(i), y, 16, COL.ink));
   });
   pill('Enter: otro turno · Esc: título', W / 2, Y + PH - 28, 20, COL.yel, COL.ink);
 }
@@ -2317,6 +2372,7 @@ const scenes = {
     update(dt) {
       animT += dt;
       if (pressed('KeyK')) { mode2P = !mode2P; reset(); sfx.signal(); }
+      if (pressed('KeyO')) { netOpenMenu(); return; }
       const pickDiff = i => { diff = DIFFS[(i + DIFFS.length) % DIFFS.length]; sfx.grab(); };
       ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Numpad1', 'Numpad2', 'Numpad3', 'Numpad4'].forEach((k, i) => { if (pressed(k)) pickDiff(i % 4); });
       if (pressed('KeyA') || pressed('ArrowLeft')) pickDiff(DIFFS.indexOf(diff) - 1);
@@ -2327,7 +2383,8 @@ const scenes = {
   },
   play: {
     update(dt) {
-      if (pressed('KeyP') || pressed('Escape')) { scene = 'pause'; return; }
+      if (net.role === 'client') { netClientUpdate(dt); return; } // the host runs the shop; this browser shows it
+      if (!online() && (pressed('KeyP') || pressed('Escape'))) { scene = 'pause'; return; } // online has no pause
       if (state.tutor && tutorUpdate()) return; // a tutorial card is up: the shop waits
       state.t += dt; animT += dt;
       if (!state.tutor) director(dt);
@@ -2353,6 +2410,7 @@ const scenes = {
   },
   over: {
     update() {
+      if (online()) { netEndScreenKeys(); return; } // the host decides: another turn or the lobby
       if (pressed('KeyR') || pressed('Enter')) { reset(); scene = 'play'; }
       else if (pressed('Escape') || pressed('KeyT')) { reset(); scene = 'title'; }
     },
@@ -2361,7 +2419,8 @@ const scenes = {
   results: {
     update(dt) {
       const before = state.resT; state.resT += dt;
-      for (let i = 0; i < state.stars; i++) { const at = 0.4 + i * 0.45; if (before < at && state.resT >= at) sfx.star(i); }
+      for (let i = 0; i < state.stars; i++) { const at = 0.4 + i * 0.45; if (before < at && state.resT >= at && net.role !== 'client') sfx.star(i); } // a client hears the host's
+      if (online()) { netEndScreenKeys(); return; }
       if (pressed('Enter')) { reset(); scene = 'play'; }
       else if (pressed('Escape')) { reset(); scene = 'title'; }
     },
@@ -2372,7 +2431,7 @@ const scenes = {
 // ---- Loop: fixed step, frame time clamped ---------------------------------------------
 function step() {
   if (pressed('KeyM')) { setMuted(!muted); hit.delete('KeyM'); }
-  scenes[scene].update(STEP); hit.clear();
+  scenes[scene].update(STEP); netTick(); hit.clear();
 }
 let last, acc = 0, ALPHA = 1; // ALPHA: how far the frame is between the last two steps
 function tick() {
@@ -2404,6 +2463,7 @@ window.game = {
 initThree();
 reset();
 scene = params.get('scene') || 'title';
+netInit(); // online play: net.js; a ?sala=ABCD address opens that room
 last = clock.now(); lastDraw = last;
 if (params.get('manual') === '1') drawFrame();
 else { requestAnimationFrame(frame); setInterval(timer, 50); }

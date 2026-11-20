@@ -124,4 +124,13 @@ window.CONFIG = {
   task_reward: { value: 1, min: 0, max: 10, step: 0.5 },       // per restock, mop or bag
   star2: { value: 150, min: 10, max: 1000, step: 10 },         // S/ for two stars (finishing gives one)
   star3: { value: 215, min: 10, max: 1000, step: 5 },          // S/ for three stars
+
+  // Online play (up to 4 players)
+  online_crowd_gain: { value: 0.3, min: 0, max: 1, step: 0.05 }, // each worker beyond two: this much more crowd (customers come sooner, stars cost more)
+  net_snapshot_hz: { value: 20, min: 5, max: 60, step: 5 },    // snapshots per second the host sends
+  net_input_hz: { value: 30, min: 5, max: 60, step: 5 },       // position and key reports per second a client sends
+  net_smooth: { value: 16, min: 2, max: 60, step: 1 },         // how fast other players and customers glide to their latest spot (1/s)
+  net_snap_dist: { value: 1.2, min: 0.3, max: 4, step: 0.1 },  // tiles: farther than this, a figure jumps instead of gliding
+  net_timeout: { value: 8, min: 3, max: 30, step: 1 },         // s of silence before a player is dropped
+  net_join_timeout: { value: 12, min: 4, max: 40, step: 1 },   // s to wait for a room before giving up
 };
