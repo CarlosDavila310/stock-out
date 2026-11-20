@@ -195,6 +195,7 @@ function netDrop(slot) {
 }
 function netStartRound() { // host: a new turn for everyone in the room
   net.phase = 'playing'; diff = net.diff; net.inputs = {}; net.fx = []; net.lastScene = null;
+  for (const rec of net.conns.values()) rec.seen = clock.now(); // the lobby was quiet: nobody has gone silent yet
   reset(); scene = 'play'; sfx.banner();
   netBroadcast({ t: 'start', roster: net.roster, bot: net.bot, diff: net.diff });
 }
@@ -211,6 +212,10 @@ function netEndScreenKeys() { // over and results, online
 
 // ---- The host's clock: snapshots out, silent clients dropped ------------------------------------
 function netTick() {
+  if (net.role === 'client' && net.phase === 'playing' && scene !== 'play') { // results and lost-shift screens: still say "here" now and then
+    net.sendT -= STEP;
+    if (net.sendT <= 0) { net.sendT = 1; netSend(net.hostConn, { t: 'ping' }); }
+  }
   if (net.role !== 'host' || net.phase !== 'playing') return;
   net.k++;
   const every = Math.max(1, Math.round(60 / tune.net_snapshot_hz));
